@@ -1,5 +1,7 @@
 package com.ecgapp.ecgapp.models
 
+import java.time.LocalDate
+import java.time.LocalDateTime
 
 import jakarta.persistence.*
 
@@ -12,12 +14,19 @@ data class User(
     @Column(nullable = false, unique = true)
     val email: String,
 
-    @Column(nullable = false)
+    @Column(name = "password_hash", nullable = false)
     val password: String,
 
+    @Column(name = "age")
     val age: Int,
+    @Column(name = "gender")
     val gender: String,
-    val profilePicture: String? // Can be a file path or URL
+
+    @Column(name = "created_at")
+    val createdAt: LocalDateTime? = null,
+
+    @Column(name = "profile_picture")
+    val profilePicture: String, // Can be a file path or URL
 
     @OneToOne(mappedBy = "user", cascade = [CascadeType.ALL])
     val medicalInfo: MedicalInfo? = null

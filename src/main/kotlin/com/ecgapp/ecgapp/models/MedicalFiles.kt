@@ -1,5 +1,5 @@
 package com.ecgapp.ecgapp.models
-
+import java.time.LocalDateTime
 import jakarta.persistence.*
 
 @Entity
@@ -7,9 +7,17 @@ import jakarta.persistence.*
 data class MedicalFile(
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
     val id: Long = 0,
+
+    @Column(name = "file_name")
+    val name: String,
+
+    @Column(name = "file_url")
     val filePath: String,
-    val fileType: String,
-    
+
+
+    @Column(name = "uploaded_at")
+    val uploadedAt: LocalDateTime? = null,
+
     @ManyToOne
     @JoinColumn(name = "medical_info_id", nullable = false)
     val medicalInfo: MedicalInfo
