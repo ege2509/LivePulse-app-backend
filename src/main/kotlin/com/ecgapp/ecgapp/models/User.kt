@@ -11,10 +11,13 @@ data class User(
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
     val id: Long = 0,
 
+    @Column(name = "full_name", nullable = false)
+    val name: String,
+
     @Column(nullable = false, unique = true)
     val email: String,
 
-    @Column(name = "password_hash", nullable = false)
+    @Column(name = "password", nullable = false)
     val password: String,
 
     @Column(name = "age")
@@ -26,7 +29,7 @@ data class User(
     val createdAt: LocalDateTime? = null,
 
     @Column(name = "profile_picture")
-    val profilePicture: String, // Can be a file path or URL
+    val profilePicture: String? = null, // Can be a file path or URL
 
     @OneToOne(mappedBy = "user", cascade = [CascadeType.ALL])
     val medicalInfo: MedicalInfo? = null

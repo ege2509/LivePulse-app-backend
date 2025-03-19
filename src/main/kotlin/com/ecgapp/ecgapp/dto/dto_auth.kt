@@ -1,0 +1,19 @@
+package com.ecgapp.ecgapp.dto
+
+
+data class RegisterRequest(
+    val name: String,
+    val email: String,
+    val password: String,
+    val age: Int,
+    val gender: String
+)
+
+data class LoginRequest(
+    val email: String,
+    val password: String
+)
+
+data class BasicResponse(
+    val message: String
+)
