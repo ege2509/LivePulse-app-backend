@@ -18,8 +18,7 @@ class SecurityConfig {
         http
             .csrf { it.disable() } // turn off CSRF
             .authorizeHttpRequests {
-                it.requestMatchers("/users/register", "/users/login").permitAll()
-                it.anyRequest().authenticated()
+                it.anyRequest().permitAll()
             }
 
         return http.build()

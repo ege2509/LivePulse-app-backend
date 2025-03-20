@@ -8,6 +8,9 @@ import com.ecgapp.ecgapp.dto.LoginRequest
 import com.ecgapp.ecgapp.dto.BasicResponse
 import org.springframework.stereotype.Service
 
+import org.springframework.security.core.context.SecurityContextHolder
+import org.springframework.security.core.userdetails.UsernameNotFoundException
+
 
 @Service
 class UserService(
@@ -50,5 +53,11 @@ class UserService(
         } else {
             BasicResponse("Invalid username or password")
         }
+    }
+
+    fun getCurrentUser(): User {
+        val email = SecurityContextHolder.getContext().authentication.name
+        return userRepository.findByEmail(email)
+            ?: throw UsernameNotFoundException("User not found")
     }
 }
