@@ -17,7 +17,7 @@ class EcgProcessingService(
     private val ecgRepo: EcgRecordingRepository,
     private val medicalInfoRepo: MedicalInfoRepository
 ) {
-
+/* 
     suspend fun processRawData(inputStream: InputStream, userId: Long) {
         // Read the raw ECG data
         val rawData = inputStream.readNBytes(2_000_000) // Read a 2MB packet
@@ -66,5 +66,5 @@ class EcgProcessingService(
     private fun calculateHeartRate(filteredData: IntArray): Int {
         // Example: Just a dummy heart rate value for now
         return 70  // Replace with actual heart rate calculation logic
-    }
+    }*/
 }

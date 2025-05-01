@@ -16,7 +16,7 @@ data class MedicalInfo(
 
     @Column(name = "medications")
     val medications: String? = null,
-
+    
     @OneToOne
     @JoinColumn(name = "user_id", nullable = false)
     val user: User,

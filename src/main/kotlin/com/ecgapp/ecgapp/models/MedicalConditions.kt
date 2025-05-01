@@ -1,13 +1,14 @@
 package com.ecgapp.ecgapp.models
 import java.time.LocalDate
 import java.time.LocalDateTime
+import com.fasterxml.jackson.annotation.JsonIgnore
 import jakarta.persistence.*
 
 @Entity
 @Table(name = "medical_conditions")
 data class MedicalCondition(
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
-    val id: Long = 0,
+    val id: Int = 0,
 
     @Column(name = "condition_name")
     val name: String,
@@ -25,6 +26,7 @@ data class MedicalCondition(
     @Column(name = "severity")
     val severity: String,
     
+    @JsonIgnore  // This prevents including the full MedicalInfo in JSON
     @ManyToOne
     @JoinColumn(name = "medical_info_id", nullable = false)
     val medicalInfo: MedicalInfo

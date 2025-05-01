@@ -14,7 +14,7 @@ class TcpEcgReceiverService(
     private val ecgRepo: EcgRecordingRepository,
     private val medicalInfoRepo: MedicalInfoRepository
 ) {
-    private val port = 9999 // Change to match what ECG device sends to
+/*    private val port = 8080 // Change to match what ECG device sends to
 
     init {
         runBlocking {
@@ -60,5 +60,5 @@ class TcpEcgReceiverService(
     private fun calculateHeartRate(rawData: ByteArray): Int {
         // Implement real logic for calculating heart rate from ECG raw data
         return 70
-    }
+    }*/
 }
