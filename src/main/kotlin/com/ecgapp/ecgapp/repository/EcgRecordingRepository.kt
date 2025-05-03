@@ -5,4 +5,6 @@ import org.springframework.data.jpa.repository.JpaRepository
 import org.springframework.stereotype.Repository
 
 @Repository
-interface EcgRecordingRepository : JpaRepository<EcgRecording, Int>
+interface EcgRecordingRepository : JpaRepository<EcgRecording, Int> {
+    fun findByMedicalInfoId(medicalInfoUserId: Long): List<EcgRecording>
+}

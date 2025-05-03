@@ -6,7 +6,7 @@ import jakarta.persistence.*
 @Table(name = "medical_info")
 data class MedicalInfo(
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
-    val id: Int = 0,
+    val id: Long = 0,
 
     @Column(name = "blood_type")
     val bloodType: String? = null,

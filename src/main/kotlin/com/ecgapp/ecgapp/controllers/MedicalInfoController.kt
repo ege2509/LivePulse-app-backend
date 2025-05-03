@@ -77,7 +77,7 @@ class MedicalInfoController(
     fun updateUserAllergies(@RequestParam userId: Long, @RequestBody newAllergies: String): ResponseEntity<String> {
         val updatedInfo = medicalInfoService.updateUserAllergies(userId, newAllergies)
         return if (updatedInfo != null) {
-            ResponseEntity.ok("Allergies updated successfully")
+            ResponseEntity.ok("Allergies added successfully")
         } else {
             ResponseEntity.notFound().build()
         }
