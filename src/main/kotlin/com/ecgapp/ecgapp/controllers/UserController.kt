@@ -17,6 +17,12 @@ class UserController(
 
 ) {
 
+    @GetMapping
+    fun getAllUsers(): ResponseEntity<List<User>> {
+        val users = userRepository.findAll()
+        return ResponseEntity.ok(users)
+    }
+
     @GetMapping("/{id}")
     fun getUserProfile(@PathVariable id: Long): ResponseEntity<User> {
         val user = userRepository.findById(id)

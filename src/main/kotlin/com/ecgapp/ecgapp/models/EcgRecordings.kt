@@ -2,6 +2,7 @@ package com.ecgapp.ecgapp.models
 
 import jakarta.persistence.*
 import java.time.LocalDateTime
+import com.fasterxml.jackson.annotation.JsonBackReference
 
 @Entity
 @Table(name = "ecg_recordings")
@@ -36,6 +37,7 @@ data class EcgRecording(
     
     @ManyToOne
     @JoinColumn(name = "medical_info_id", nullable = false)
+    @JsonBackReference // Child side of reference - will be excluded from serialization
     val medicalInfo: MedicalInfo,
 
     @OneToMany(mappedBy = "ecgRecording", cascade = [CascadeType.ALL], orphanRemoval = true)

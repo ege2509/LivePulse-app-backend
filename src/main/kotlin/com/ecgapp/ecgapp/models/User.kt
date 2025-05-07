@@ -2,6 +2,7 @@ package com.ecgapp.ecgapp.models
 
 import java.time.LocalDate
 import java.time.LocalDateTime
+import com.fasterxml.jackson.annotation.JsonManagedReference
 
 import jakarta.persistence.*
 
@@ -31,6 +32,7 @@ data class User(
     @Column(name = "profile_picture")
     val profilePicture: String? = null, // Can be a file path or URL
 
-    @OneToOne(mappedBy = "user", cascade = [CascadeType.ALL])
+    @OneToOne(mappedBy = "user", cascade = [CascadeType.ALL], fetch = FetchType.LAZY)
+    @JsonManagedReference
     val medicalInfo: MedicalInfo? = null
 )

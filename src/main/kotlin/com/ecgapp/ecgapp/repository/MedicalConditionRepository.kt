@@ -7,4 +7,5 @@ import org.springframework.stereotype.Repository
 @Repository
 interface MedicalConditionRepository : JpaRepository<MedicalCondition, Int> {
     fun findByMedicalInfoId(medicalInfoId: Long): List<MedicalCondition>
+    fun findByMedicalInfoIdIn(medicalInfoIds: List<Long>): List<MedicalCondition>
 }

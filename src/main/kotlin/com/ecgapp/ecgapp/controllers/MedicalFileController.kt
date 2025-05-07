@@ -17,6 +17,23 @@ class MedicalFileController(
     val medicalInfoRepository: MedicalInfoRepository
 ) {
 
+    @GetMapping("/user/{userId}")
+    fun getAllFiles(): ResponseEntity<List<MedicalFileResponseDTO>> {
+        val allFiles = medicalFileRepository.findAll()
+        
+        val response = allFiles.map {
+            MedicalFileResponseDTO(
+                id = it.id,
+                fileName = it.name,
+                fileUrl = it.filePath,
+                uploadedAt = it.uploadedAt ?: LocalDateTime.now(),
+                medicalInfoId = it.medicalInfo.id
+            )
+        }
+        
+        return ResponseEntity.ok(response)
+    }
+
     @PostMapping
     fun uploadFile(@RequestBody request: MedicalFileUploadDTO): ResponseEntity<Any> {
         // Now request.medicalInfoId is Long, so there's no type mismatch

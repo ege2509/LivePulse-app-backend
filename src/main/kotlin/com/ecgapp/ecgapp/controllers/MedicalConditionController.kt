@@ -19,6 +19,31 @@ class MedicalConditionController(
     // Logger for proper logging
     private val logger = org.slf4j.LoggerFactory.getLogger(MedicalConditionController::class.java)
 
+
+
+    @GetMapping("/user/{userId}")
+    fun getAllConditionsByUser(@PathVariable userId: Long): ResponseEntity<List<MedicalCondition>> {
+        logger.info("Fetching medical conditions for user ID: {}", userId)
+        return try {
+            val medicalInfo = infoRepo.findByUserId(userId)
+    
+            if (medicalInfo == null) {
+                logger.info("No medical info found for user ID: {}", userId)
+                return ResponseEntity.ok(emptyList())
+            }
+    
+            val conditions = conditionRepo.findByMedicalInfoIdIn(listOf(medicalInfo.id))
+            logger.info("Retrieved {} medical conditions for user ID: {}", conditions.size, userId)
+    
+            ResponseEntity.ok(conditions)
+        } catch (e: Exception) {
+            logger.error("Error retrieving conditions for user ID {}: {}", userId, e.message, e)
+            ResponseEntity.internalServerError().build()
+        }
+    }
+    
+
+
     @GetMapping("/{id}")
     fun getConditionById(@PathVariable id: Int): ResponseEntity<MedicalCondition> {
         val condition = conditionRepo.findById(id)

@@ -1,7 +1,7 @@
 package com.ecgapp.ecgapp.models
 import java.time.LocalDate
 import java.time.LocalDateTime
-import com.fasterxml.jackson.annotation.JsonIgnore
+import com.fasterxml.jackson.annotation.JsonBackReference
 import jakarta.persistence.*
 
 @Entity
@@ -19,15 +19,14 @@ data class MedicalCondition(
     @Column(columnDefinition = "TEXT")
     val notes: String? = null,
 
-
     @Column(name = "created_at")
     val createdAt: LocalDateTime? = null,
 
     @Column(name = "severity")
     val severity: String,
     
-    @JsonIgnore  // This prevents including the full MedicalInfo in JSON
     @ManyToOne
     @JoinColumn(name = "medical_info_id", nullable = false)
+    @JsonBackReference // Child side of reference - will be excluded from serialization
     val medicalInfo: MedicalInfo
 )
