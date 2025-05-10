@@ -3,7 +3,7 @@ package com.ecgapp.ecgapp.controllers
 import com.ecgapp.ecgapp.models.EcgRecording
 import com.ecgapp.ecgapp.repository.EcgRecordingRepository
 import com.ecgapp.ecgapp.services.EcgProcessingService
-import com.ecgapp.ecgapp.services.RealtimeEcgService
+import com.ecgapp.ecgapp.service.RealtimeEcgService
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import org.springframework.http.MediaType

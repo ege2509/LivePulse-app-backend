@@ -1,66 +1,87 @@
-package com.ecgapp.ecgapp.handlers
+package com.ecgapp.ecgapp.config
 
-import com.ecgapp.ecgapp.services.RealtimeEcgService
-import kotlinx.coroutines.runBlocking
+import com.ecgapp.ecgapp.service.RealtimeEcgService
+import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Component
-import org.springframework.web.socket.BinaryMessage
 import org.springframework.web.socket.CloseStatus
+import org.springframework.web.socket.TextMessage
 import org.springframework.web.socket.WebSocketSession
-import org.springframework.web.socket.handler.AbstractWebSocketHandler
-import org.springframework.web.util.UriTemplate
-import java.util.concurrent.ConcurrentHashMap
+import org.springframework.web.socket.handler.TextWebSocketHandler
+import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.annotation.GetMapping
+import org.springframework.web.bind.annotation.RestController
+
+import org.slf4j.LoggerFactory
 
 @Component
-class EcgWebSocketHandler(private val realtimeEcgService: RealtimeEcgService) : AbstractWebSocketHandler() {
-
-    private val sessions = ConcurrentHashMap<String, Long>()
-    private val uriTemplate = UriTemplate("/api/ecg/stream/{userId}")
-
+class EcgWebSocketHandler : TextWebSocketHandler() {
+    
+    private val logger = LoggerFactory.getLogger(EcgWebSocketHandler::class.java)
+    
+    @Autowired
+    private lateinit var ecgService: RealtimeEcgService
+    
     override fun afterConnectionEstablished(session: WebSocketSession) {
-        // Extract user ID from path
+        // Extract userId from session attributes or URI parameters
         val userId = extractUserId(session)
-        if (userId != null) {
-            sessions[session.id] = userId
-            realtimeEcgService.registerSession(userId, session)
-            println("WebSocket connection established for user $userId")
-        } else {
-            session.close(CloseStatus.BAD_DATA.withReason("Invalid user ID"))
-        }
-    }
-
-    override fun handleBinaryMessage(session: WebSocketSession, message: BinaryMessage) {
-        val userId = sessions[session.id] ?: return
         
-        // Process incoming binary data
-        runBlocking {
-            realtimeEcgService.processIncomingData(message.payload.array(), userId)
-        }
-    }
-
-    override fun afterConnectionClosed(session: WebSocketSession, status: CloseStatus) {
-        val userId = sessions.remove(session.id)
         if (userId != null) {
-            realtimeEcgService.unregisterSession(userId)
+            // Register this session with our ECG service
+            ecgService.registerSession(userId, session)
             
-            // Finalize the recording when the session closes
-            runBlocking {
-                val recording = realtimeEcgService.finalizeRecording(userId)
-                if (recording != null) {
-                    println("Finalized ECG recording for user $userId (ID: ${recording.id})")
+            // Send a connection confirmation
+            session.sendMessage(TextMessage("""
+                {
+                    "type": "CONNECTION_ESTABLISHED",
+                    "userId": $userId,
+                    "timestamp": ${System.currentTimeMillis()},
+                    "message": "WebSocket connection established"
                 }
-            }
+            """.trimIndent()))
+            
+            logger.info("WebSocket connection established for user $userId")
+        } else {
+            // If userId is not provided, close the connection
+            session.close(CloseStatus.BAD_DATA.withReason("Missing userId parameter"))
+            logger.warn("Rejected WebSocket connection: missing userId parameter")
         }
     }
-
+    
+    override fun afterConnectionClosed(session: WebSocketSession, status: CloseStatus) {
+        val userId = extractUserId(session)
+        
+        if (userId != null) {
+            // Unregister this session
+            ecgService.unregisterSession(userId)
+            logger.info("WebSocket connection closed for user $userId: ${status.reason}")
+        }
+    }
+    
+    override fun handleTextMessage(session: WebSocketSession, message: TextMessage) {
+        // If your frontend needs to send commands (like pausing, changing display settings)
+        // you'd handle them here
+        logger.debug("Received message from client: ${message.payload}")
+        
+        // For now, we'll just acknowledge receipt
+        session.sendMessage(TextMessage("""
+            {
+                "type": "MESSAGE_RECEIVED",
+                "timestamp": ${System.currentTimeMillis()},
+                "originalMessage": ${message.payload.length} // sending length to avoid echo
+            }
+        """.trimIndent()))
+    }
+    
+    /**
+     * Extract userId from URL parameters
+     */
     private fun extractUserId(session: WebSocketSession): Long? {
         val uri = session.uri ?: return null
-        val match = uriTemplate.match(uri.path)
-        val userIdStr = match["userId"] ?: return null
+        val query = uri.query ?: return null
         
-        return try {
-            userIdStr.toLong()
-        } catch (e: NumberFormatException) {
-            null
-        }
+        return query.split("&")
+            .firstOrNull { it.startsWith("userId=") }
+            ?.substringAfter("userId=")
+            ?.toLongOrNull()
     }
 }

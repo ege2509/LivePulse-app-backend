@@ -1,4 +1,4 @@
-package com.ecgapp.ecgapp.services
+package com.ecgapp.ecgapp.service
 
 import com.ecgapp.ecgapp.models.EcgRecording
 import com.ecgapp.ecgapp.models.MedicalInfo
@@ -64,6 +64,7 @@ class RealtimeEcgService(
         
         println("Registered WebSocket session for user $userId")
     }
+
     
     /**
      * Unregister a WebSocket session
@@ -125,6 +126,24 @@ class RealtimeEcgService(
             ecgDataFlow.emit(packet)
         }
     }
+
+    /**
+ * Send an EcgDataPacket directly to a client
+ * Used for testing or manual data injection
+ */
+    suspend fun sendDirectPacket(userId: Long, packet: EcgDataPacket) {
+        try {
+            // Send to WebSocket client
+            sendToClient(userId, packet)
+
+            // Emit to flow for other subscribers
+            ecgDataFlow.emit(packet)
+        } catch (e: Exception) {
+            println("Error sending direct packet: ${e.message}")
+            e.printStackTrace()
+        }
+    }
+
     
     /**
      * Finalize an ECG recording session
@@ -249,22 +268,20 @@ class RealtimeEcgService(
             return
         }
         
-        // Convert to JSON - include all leads and abnormality data
+        // Convert to JSON - optimized for direct use in frontend visualization
         val json = buildString {
             append("{")
             append("\"timestamp\": ${packet.timestamp},")
             append("\"heartRate\": ${packet.heartRate},")
             
-            // Add multi-lead data
-            append("\"leads\": [")
+            // Add multi-lead data as direct arrays for easier frontend processing
+            append("\"leads\": {")
             packet.ecgData.forEachIndexed { leadIndex, leadData ->
                 if (leadIndex > 0) append(",")
-                append("{")
-                append("\"lead\": ${leadIndex + 1},")
-                append("\"data\": [${leadData.joinToString(",")}]")
-                append("}")
+                // Use lead number as key (1-based for standard ECG naming)
+                append("\"${leadIndex + 1}\": [${leadData.joinToString(",")}]")
             }
-            append("],")
+            append("},")
             
             // Add abnormalities
             append("\"abnormalities\": {")

@@ -4,6 +4,7 @@ import com.ecgapp.ecgapp.models.EcgRecording
 import com.ecgapp.ecgapp.models.MedicalInfo
 import com.ecgapp.ecgapp.repository.EcgRecordingRepository
 import com.ecgapp.ecgapp.repository.MedicalInfoRepository
+import com.ecgapp.ecgapp.service.RealtimeEcgService
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.Flow
