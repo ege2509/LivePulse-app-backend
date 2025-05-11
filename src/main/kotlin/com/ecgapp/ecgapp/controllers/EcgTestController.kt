@@ -1,32 +1,36 @@
 package com.ecgapp.ecgapp.controller
 
+import com.ecgapp.ecgapp.service.EcgDiagnosticObserver
 import com.ecgapp.ecgapp.service.RealtimeEcgService
 import com.ecgapp.ecgapp.service.RealtimeEcgService.EcgDataPacket
 import kotlinx.coroutines.runBlocking
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.MediaType
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.util.concurrent.ConcurrentHashMap
 import java.util.UUID
-import org.springframework.web.socket.TextMessage
-import org.springframework.web.socket.WebSocketSession
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import org.springframework.http.ResponseEntity
+import jakarta.annotation.PostConstruct
 
 @RestController
 @RequestMapping("/api/ecg")
-class EcgTestController {
+class EcgTestController : EcgDiagnosticObserver {
     
- @Autowired
+    @Autowired
     private lateinit var realtimeEcgService: RealtimeEcgService
     
     // Store active connections for monitoring
     private val activeConnections = ConcurrentHashMap<Long, ConnectionDiagnostics>()
     private val packetCounter = AtomicInteger(0)
     private val testInProgress = AtomicBoolean(false)
+    
+    // Register this controller as an observer after construction
+    @PostConstruct
+    fun init() {
+        realtimeEcgService.registerDiagnosticObserver(this)
+    }
     
     data class ConnectionDiagnostics(
         val userId: Long,
@@ -38,9 +42,36 @@ class EcgTestController {
         var errors: MutableList<String> = mutableListOf()
     )
 
+    /**
+     * Implementation of EcgDiagnosticObserver.registerConnection
+     */
+    override fun registerConnection(userId: Long) {
+        activeConnections.computeIfAbsent(userId) { 
+            ConnectionDiagnostics(userId) 
+        }
+    }
 
+    /**
+     * Implementation of EcgDiagnosticObserver.unregisterConnection
+     */
+    override fun unregisterConnection(userId: Long) {
+        activeConnections.remove(userId)
+    }
 
-    // 3. Update EcgTestController's WebSocket status endpoint to use the real stats
+    /**
+     * Implementation of EcgDiagnosticObserver.updateConnectionStats
+     */
+    override fun updateConnectionStats(userId: Long, packet: RealtimeEcgService.EcgDataPacket) {
+        val diagnostics = activeConnections.computeIfAbsent(userId) { 
+            ConnectionDiagnostics(userId) 
+        }
+        
+        diagnostics.lastPacketTime = System.currentTimeMillis()
+        diagnostics.packetsSent++
+        diagnostics.lastHeartRate = packet.heartRate
+        diagnostics.lastAbnormality = packet.abnormalities
+            .maxByOrNull { it.value }?.key ?: "None"
+    }
 
     @GetMapping("/websocket/status")
     fun getWebSocketStatus(): ResponseEntity<Map<String, Any>> {
@@ -194,7 +225,7 @@ class EcgTestController {
     @PostMapping("/test/continuous/{userId}")
     fun startContinuousTest(
         @PathVariable userId: Long,
-        @RequestParam(required = false, defaultValue = "5") seconds: Int,
+        @RequestParam(required = false, defaultValue = "15") seconds: Int,
         @RequestParam(required = false, defaultValue = "150") intervalMs: Int,
         @RequestParam(required = false, defaultValue = "false") includeAbnormal: Boolean
     ): ResponseEntity<Map<String, Any>> {

@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.withContext
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import org.springframework.web.socket.TextMessage
 import org.springframework.web.socket.WebSocketSession
@@ -16,11 +17,35 @@ import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import com.fasterxml.jackson.databind.ObjectMapper
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.context.ApplicationEventPublisher
 
 @Service
 class RealtimeEcgService(
-    private val medicalInfoRepo: MedicalInfoRepository
+    private val medicalInfoRepo: MedicalInfoRepository,
+    @Autowired private val eventPublisher: ApplicationEventPublisher
 ) {
+
+    private val logger = LoggerFactory.getLogger(RealtimeEcgService::class.java)
+    private val objectMapper = ObjectMapper()
+    
+    // Store active sessions
+    private val activeSessions = ConcurrentHashMap<Long, WebSocketSession>()
+    
+    // Dependency injection for observers (replacing direct EcgTestController reference)
+    private val diagnosticObservers = mutableListOf<EcgDiagnosticObserver>()
+    
+    // Register an observer
+    fun registerDiagnosticObserver(observer: EcgDiagnosticObserver) {
+        diagnosticObservers.add(observer)
+    }
+    
+    // Remove an observer
+    fun unregisterDiagnosticObserver(observer: EcgDiagnosticObserver) {
+        diagnosticObservers.remove(observer)
+    }
+    
     // Common ECG constants
     companion object {
         const val DEFAULT_SAMPLE_RATE = 400 // Hz - matching the dataset sample rate
@@ -36,8 +61,6 @@ class RealtimeEcgService(
         val ABNORMALITY_TYPES = listOf("1dAVb", "RBBB", "LBBB", "SB", "AF", "ST")
     }
     
-    // Store active sessions by user ID
-    private val activeSessions = ConcurrentHashMap<Long, WebSocketSession>()
     
     // Buffer for each user's ECG data - now stores multi-lead data
     private val dataBuffers = ConcurrentHashMap<Long, Array<CircularBuffer<Float>>>()
@@ -55,14 +78,16 @@ class RealtimeEcgService(
      */
     fun registerSession(userId: Long, session: WebSocketSession) {
         activeSessions[userId] = session
+        logger.info("Registered WebSocket session for user $userId")
         
-        // Initialize buffer for all leads
-        val multiLeadBuffer = Array(DEFAULT_NUM_LEADS) { 
-            CircularBuffer<Float>(BUFFER_SIZE)
+        // Initialize buffer if needed
+        if (!dataBuffers.containsKey(userId)) {
+            val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
+            dataBuffers[userId] = buffers
         }
-        dataBuffers[userId] = multiLeadBuffer
         
-        println("Registered WebSocket session for user $userId")
+        // Notify observers
+        diagnosticObservers.forEach { it.registerConnection(userId) }
     }
 
     
@@ -71,8 +96,10 @@ class RealtimeEcgService(
      */
     fun unregisterSession(userId: Long) {
         activeSessions.remove(userId)
-        dataBuffers.remove(userId)
-        println("Unregistered WebSocket session for user $userId")
+        logger.info("Unregistered WebSocket session for user $userId")
+        
+        // Notify observers
+        diagnosticObservers.forEach { it.unregisterConnection(userId) }
     }
     
     /**
@@ -81,6 +108,12 @@ class RealtimeEcgService(
      * @param userId User ID associated with this data
      */
     suspend fun processIncomingData(rawBytes: ByteArray, userId: Long) = withContext(Dispatchers.IO) {
+        // Initialize buffer if needed
+        if (!dataBuffers.containsKey(userId)) {
+            val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
+            dataBuffers[userId] = buffers
+        }
+        
         val buffers = dataBuffers[userId] ?: return@withContext
         
         // Decode the raw data into multi-lead format
@@ -128,19 +161,39 @@ class RealtimeEcgService(
     }
 
     /**
- * Send an EcgDataPacket directly to a client
- * Used for testing or manual data injection
- */
+     * Get count of active sessions
+     */
+    fun getActiveSessionCount(): Int {
+        return activeSessions.size
+    }
+    
+    /**
+     * Get list of active user IDs
+     */
+    fun getActiveUserIds(): Set<Long> {
+        return activeSessions.keys
+    }
+    
+    /**
+     * Send ECG data to a specific user
+     */
     suspend fun sendDirectPacket(userId: Long, packet: EcgDataPacket) {
-        try {
-            // Send to WebSocket client
-            sendToClient(userId, packet)
-
-            // Emit to flow for other subscribers
-            ecgDataFlow.emit(packet)
-        } catch (e: Exception) {
-            println("Error sending direct packet: ${e.message}")
-            e.printStackTrace()
+        val session = activeSessions[userId]
+        
+        if (session != null && session.isOpen) {
+            try {
+                val jsonMessage = objectMapper.writeValueAsString(packet)
+                withContext(Dispatchers.IO) {
+                    session.sendMessage(TextMessage(jsonMessage))
+                }
+                // Notify observers about successful send
+                diagnosticObservers.forEach { it.updateConnectionStats(userId, packet) }
+            } catch (e: Exception) {
+                logger.error("Error sending data to user $userId: ${e.message}")
+                throw e
+            }
+        } else {
+            logger.warn("Cannot send data: No active session for user $userId")
         }
     }
 
@@ -296,6 +349,9 @@ class RealtimeEcgService(
         
         // Send via WebSocket
         session.sendMessage(TextMessage(json))
+        
+        // Notify observers about successful send
+        diagnosticObservers.forEach { it.updateConnectionStats(userId, packet) }
     }
     
     /**
@@ -606,36 +662,38 @@ class RealtimeEcgService(
      * Data class for real-time ECG data packets with added abnormality detection
      */
     data class EcgDataPacket(
-        val userId: Long,
-        val timestamp: Long,
-        val ecgData: Array<FloatArray>,
-        val heartRate: Int,
-        val abnormalities: Map<String, Float> = emptyMap()
-    ) {
-        override fun equals(other: Any?): Boolean {
-            if (this === other) return true
-            if (javaClass != other?.javaClass) return false
-
-            other as EcgDataPacket
-
-            if (userId != other.userId) return false
-            if (timestamp != other.timestamp) return false
-            if (!ecgData.contentDeepEquals(other.ecgData)) return false
-            if (heartRate != other.heartRate) return false
-            if (abnormalities != other.abnormalities) return false
-
-            return true
+    val userId: Long,
+    val timestamp: Long,
+    val ecgData: Array<FloatArray>,  // Original format: 2D array [lead][datapoints]
+    val heartRate: Int,
+    val abnormalities: Map<String, Float> = emptyMap()
+) {
+    /**
+     * Convert to frontend-compatible JSON format
+     */
+    fun toFrontendJson(): String {
+        val mapper = ObjectMapper()
+        
+        // Create a map with lead indices as keys
+        val leadDataMap = mutableMapOf<String, FloatArray>()
+        for (i in ecgData.indices) {
+            leadDataMap[i.toString()] = ecgData[i]
         }
-
-        override fun hashCode(): Int {
-            var result = userId.hashCode()
-            result = 31 * result + timestamp.hashCode()
-            result = 31 * result + ecgData.contentDeepHashCode()
-            result = 31 * result + heartRate
-            result = 31 * result + abnormalities.hashCode()
-            return result
-        }
+        
+        // Create the frontend-compatible structure
+        val frontendStructure = mapOf(
+            "userId" to userId,
+            "timestamp" to timestamp,
+            "heartRate" to heartRate,
+            "abnormalities" to abnormalities,
+            "leadData" to leadDataMap  // This is what the frontend expects
+        )
+        
+        return mapper.writeValueAsString(frontendStructure)
     }
+    
+    // Existing equals/hashCode methods...
+}
     
     /**
      * Circular buffer implementation for efficient storage of streaming data
