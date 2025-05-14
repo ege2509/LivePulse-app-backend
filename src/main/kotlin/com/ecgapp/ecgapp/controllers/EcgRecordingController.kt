@@ -90,13 +90,4 @@ class EcgController(
             }
     }
     
-    // Endpoint for device simulator to push data (for testing)
-    @PostMapping("/simulate/{userId}")
-    suspend fun simulateEcgData(
-        @PathVariable userId: Long,
-        @RequestBody rawData: ByteArray
-    ): ResponseEntity<Map<String, String>> {
-        realtimeEcgService.processIncomingData(rawData, userId)
-        return ResponseEntity.ok(mapOf("status" to "Data received"))
-    }
 }

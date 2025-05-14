@@ -32,6 +32,8 @@ class RealtimeEcgService(
     
     // Store active sessions
     private val activeSessions = ConcurrentHashMap<Long, WebSocketSession>()
+
+    private val recordingBuffers = ConcurrentHashMap<Long, Array<ArrayList<Float>>>()
     
     // Dependency injection for observers (replacing direct EcgTestController reference)
     private val diagnosticObservers = mutableListOf<EcgDiagnosticObserver>()
@@ -101,12 +103,75 @@ class RealtimeEcgService(
         // Notify observers
         diagnosticObservers.forEach { it.unregisterConnection(userId) }
     }
+
+
+    suspend fun processData(ecgData: Array<FloatArray>, userId: Long) = withContext(Dispatchers.IO) {
+        // Initialize buffer if needed
+        if (!dataBuffers.containsKey(userId)) {
+            val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
+            dataBuffers[userId] = buffers
+            
+            // Initialize recording buffer
+            recordingBuffers[userId] = Array(DEFAULT_NUM_LEADS) { ArrayList<Float>() }
+        }
+        
+        val buffers = dataBuffers[userId] ?: return@withContext
+        val recording = recordingBuffers[userId] ?: return@withContext
+        
+        // Add data to each lead's buffer
+        for (leadIndex in ecgData.indices) {
+            val leadData = ecgData[leadIndex]
+            for (sample in leadData) {
+                buffers[leadIndex].add(sample)
+                
+                // Also add to recording buffer
+                recording[leadIndex].add(sample)
+                
+                // Limit recording size to reasonable value (e.g., 1 minute)
+                if (recording[leadIndex].size > 24000) { // 60 seconds @ 400Hz
+                    recording[leadIndex].removeAt(0)
+                }
+            }
+        }
+        
+        // Process if we have enough data
+        if (buffers[0].size() >= PROCESSING_WINDOW) {
+            // Extract data from each lead for processing
+            val dataToProcess = Array(DEFAULT_NUM_LEADS) { leadIndex ->
+                buffers[leadIndex].getLastN(PROCESSING_WINDOW)
+            }
+            
+            // Apply filters to all leads
+            val filteredData = applyFilters(dataToProcess)
+            
+            // Analyze the data for abnormalities
+            val abnormalities = analyzeForAbnormalities(dataToProcess)
+            
+            // Calculate metrics using lead II (commonly used for rhythm analysis)
+            val heartRate = calculateHeartRate(buffers[1].getAll())
+            
+            // Create a data packet
+            val packet = EcgDataPacket(
+                userId = userId,
+                timestamp = System.currentTimeMillis(),
+                ecgData = filteredData,
+                heartRate = heartRate,
+                abnormalities = abnormalities
+            )
+            
+            // Send to WebSocket client
+            sendToClient(userId, packet)
+            
+            // Emit to flow for other subscribers
+            ecgDataFlow.emit(packet)
+        }
+    }
     
     /**
      * Process incoming raw ECG data
      * @param rawBytes The raw bytes from the ECG device
      * @param userId User ID associated with this data
-     */
+     
     suspend fun processIncomingData(rawBytes: ByteArray, userId: Long) = withContext(Dispatchers.IO) {
         // Initialize buffer if needed
         if (!dataBuffers.containsKey(userId)) {
@@ -158,7 +223,7 @@ class RealtimeEcgService(
             // Emit to flow for other subscribers
             ecgDataFlow.emit(packet)
         }
-    }
+    }*/
 
     /**
      * Get count of active sessions
@@ -446,7 +511,7 @@ class RealtimeEcgService(
     /**
      * Calculate heart rate from the ECG signal
      */
-    private fun calculateHeartRate(data: FloatArray): Int {
+    fun calculateHeartRate(data: FloatArray): Int {
         if (data.size < DEFAULT_SAMPLE_RATE) {
             return 70 // Default value if not enough data
         }
