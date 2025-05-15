@@ -23,17 +23,23 @@ class EcgController(
 
     private val dateFormatter = DateTimeFormatter.ISO_DATE_TIME
 
-    @PostMapping("/upload")
-    suspend fun uploadEcgData(
-        @RequestParam file: MultipartFile,
-        @RequestParam userId: Long
-    ): ResponseEntity<Map<String, Any>> {
-        val recording = ecgProcessingService.processRawData(file.inputStream, userId)
+        @PostMapping("/save-recording")
+    suspend fun saveEcgRecording(@RequestParam userId: Long): ResponseEntity<Map<String, Any>> {
+        // Call the finalizeRecording method from RealtimeEcgService
+        val recording = realtimeEcgService.finalizeRecording(userId)
+            ?: return ResponseEntity.badRequest().body(mapOf("error" to "Not enough ECG data to create a recording"))
         
+        // Save the recording to the database
+        val savedRecording = ecgRecordingRepository.save(recording)
+        
+        // Return a response with the recording details
         return ResponseEntity.ok(mapOf(
-            "id" to recording.id,
-            "heartRate" to recording.heartRate,
-            "recordingDate" to recording.recordingDate.format(dateFormatter)
+            "id" to savedRecording.id,
+            "heartRate" to savedRecording.heartRate,
+            "recordingLength" to "${(savedRecording.rawData.size / (2 * savedRecording.numLeads)) / savedRecording.sampleRate} seconds",
+            "recordingDate" to savedRecording.recordingDate.format(dateFormatter),
+            "diagnosis" to (savedRecording.diagnosis ?: "No diagnosis"),
+            "message" to "Recording saved successfully"
         ))
     }
     

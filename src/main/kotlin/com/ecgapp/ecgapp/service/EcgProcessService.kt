@@ -30,7 +30,7 @@ class EcgProcessingService(
 
     /**
      * Process raw ECG data (from uploaded files)
-     */
+     
     suspend fun processRawData(inputStream: InputStream, userId: Long): EcgRecording = withContext(Dispatchers.IO) {
         // Read all data from the input stream
         val rawData = inputStream.readAllBytes()
@@ -60,7 +60,10 @@ class EcgProcessingService(
             heartRate = heartRate,
             qrsComplexes = serializeQrsComplexes(qrsComplexes),
             recordingDate = LocalDateTime.now(),
-            medicalInfo = medicalInfo
+            medicalInfo = medicalInfo,
+            maxValues = maxValues,  // Store max values for decoding
+            minValues = minValues,  // Store min values for decoding
+            numSamples = filteredData[0].size // Store sample count for decoding
         )
 
         // Save the processed ECG data and return the saved entity
@@ -68,12 +71,12 @@ class EcgProcessingService(
         println("ECG data saved to DB (ID: ${savedRecording.id})")
 
         savedRecording
-    }
+    }*/
 
     /**
      * Decode raw byte data into multi-lead float arrays
      * Format follows the dataset: 12 leads with samples in mV
-     */
+     
     private fun decodeRawData(data: ByteArray): Array<FloatArray> {
         val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
         
@@ -96,7 +99,7 @@ class EcgProcessingService(
         }
         
         return decodedData
-    }
+    }*/
 
     /**
      * Apply filters to clean the signal for all leads

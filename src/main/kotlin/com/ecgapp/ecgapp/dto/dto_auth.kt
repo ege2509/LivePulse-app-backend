@@ -17,3 +17,10 @@ data class LoginRequest(
 data class BasicResponse(
     val message: String
 )
+
+data class LoginResponse(
+    val success: Boolean,
+    val message: String,
+    val userId: Int,
+    val token: String
+)

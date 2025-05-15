@@ -3,7 +3,12 @@ package com.ecgapp.ecgapp.service
 import com.ecgapp.ecgapp.models.EcgRecording
 import com.ecgapp.ecgapp.models.MedicalInfo
 import com.ecgapp.ecgapp.repository.MedicalInfoRepository
+import com.ecgapp.ecgapp.service.TcpEcgReceiverService
 import kotlinx.coroutines.Dispatchers
+import org.json.JSONObject
+import org.json.JSONArray
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.withContext
@@ -15,6 +20,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
+import com.ecgapp.ecgapp.service.EcgMessagePublisher
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -24,14 +30,12 @@ import org.springframework.context.ApplicationEventPublisher
 @Service
 class RealtimeEcgService(
     private val medicalInfoRepo: MedicalInfoRepository,
-    @Autowired private val eventPublisher: ApplicationEventPublisher
+    @Autowired private val eventPublisher: ApplicationEventPublisher,
+    @Autowired private val ecgMessagePublisher: EcgMessagePublisher
 ) {
-
+    // Other properties remain the same...
     private val logger = LoggerFactory.getLogger(RealtimeEcgService::class.java)
     private val objectMapper = ObjectMapper()
-    
-    // Store active sessions
-    private val activeSessions = ConcurrentHashMap<Long, WebSocketSession>()
 
     private val recordingBuffers = ConcurrentHashMap<Long, Array<ArrayList<Float>>>()
     
@@ -75,209 +79,123 @@ class RealtimeEcgService(
      */
     fun getEcgDataFlow(): Flow<EcgDataPacket> = ecgDataFlow
     
-    /**
-     * Register a new WebSocket session for a user
-     */
-    fun registerSession(userId: Long, session: WebSocketSession) {
-        activeSessions[userId] = session
-        logger.info("Registered WebSocket session for user $userId")
-        
-        // Initialize buffer if needed
-        if (!dataBuffers.containsKey(userId)) {
-            val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
-            dataBuffers[userId] = buffers
-        }
-        
-        // Notify observers
-        diagnosticObservers.forEach { it.registerConnection(userId) }
-    }
-
-    
-    /**
-     * Unregister a WebSocket session
-     */
-    fun unregisterSession(userId: Long) {
-        activeSessions.remove(userId)
-        logger.info("Unregistered WebSocket session for user $userId")
-        
-        // Notify observers
-        diagnosticObservers.forEach { it.unregisterConnection(userId) }
-    }
 
 
     suspend fun processData(ecgData: Array<FloatArray>, userId: Long) = withContext(Dispatchers.IO) {
-        // Initialize buffer if needed
-        if (!dataBuffers.containsKey(userId)) {
-            val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
-            dataBuffers[userId] = buffers
+    // Initialize buffer if needed
+    if (!dataBuffers.containsKey(userId)) {
+        val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
+        dataBuffers[userId] = buffers
+        
+        // Initialize recording buffer
+        recordingBuffers[userId] = Array(DEFAULT_NUM_LEADS) { ArrayList<Float>() }
+    }
+    
+    val buffers = dataBuffers[userId] ?: return@withContext
+    val recording = recordingBuffers[userId] ?: return@withContext
+    
+    // Keep track of how many new samples we've added
+    var samplesAdded = 0
+    
+    // Add data to each lead's buffer and recording
+    for (leadIndex in ecgData.indices) {
+        val leadData = ecgData[leadIndex]
+        samplesAdded = leadData.size // Assuming all leads have same size
+        
+        for (sample in leadData) {
+            // Add to circular buffer for real-time processing
+            buffers[leadIndex].add(sample)
             
-            // Initialize recording buffer
-            recordingBuffers[userId] = Array(DEFAULT_NUM_LEADS) { ArrayList<Float>() }
+            // Add to recording buffer for storage
+            recording[leadIndex].add(sample)
+            
+            // Limit recording size
+            val maxRecordingSize = 5 * 60 * DEFAULT_SAMPLE_RATE
+            if (recording[leadIndex].size > maxRecordingSize) {
+                recording[leadIndex].removeAt(0)
+            }
         }
-        
-        val buffers = dataBuffers[userId] ?: return@withContext
-        val recording = recordingBuffers[userId] ?: return@withContext
-        
-        // Add data to each lead's buffer
-        for (leadIndex in ecgData.indices) {
-            val leadData = ecgData[leadIndex]
-            for (sample in leadData) {
-                buffers[leadIndex].add(sample)
-                
-                // Also add to recording buffer
-                recording[leadIndex].add(sample)
-                
-                // Limit recording size to reasonable value (e.g., 1 minute)
-                if (recording[leadIndex].size > 24000) { // 60 seconds @ 400Hz
-                    recording[leadIndex].removeAt(0)
+    }
+    
+    // CRITICAL FIX: Only process if we have new data to process
+    if (samplesAdded > 0) {
+        // Extract ONLY THE NEW data points that were just added
+        // This is the key change to prevent duplicated or repeated waveforms
+        val dataToProcess = Array(DEFAULT_NUM_LEADS) { leadIndex ->
+            // Get only the most recent samples we just added
+            val recentData = FloatArray(samplesAdded)
+            val buffer = buffers[leadIndex]
+            val allData = buffer.getAll()
+            
+            // Copy just the newest samples
+            for (i in 0 until samplesAdded) {
+                val index = allData.size - samplesAdded + i
+                if (index >= 0 && index < allData.size) {
+                    recentData[i] = allData[index]
                 }
             }
+            recentData
         }
         
-        // Process if we have enough data
-        if (buffers[0].size() >= PROCESSING_WINDOW) {
-            // Extract data from each lead for processing
-            val dataToProcess = Array(DEFAULT_NUM_LEADS) { leadIndex ->
-                buffers[leadIndex].getLastN(PROCESSING_WINDOW)
-            }
-            
-            // Apply filters to all leads
-            val filteredData = applyFilters(dataToProcess)
-            
-            // Analyze the data for abnormalities
-            val abnormalities = analyzeForAbnormalities(dataToProcess)
-            
-            // Calculate metrics using lead II (commonly used for rhythm analysis)
-            val heartRate = calculateHeartRate(buffers[1].getAll())
-            
-            // Create a data packet
-            val packet = EcgDataPacket(
-                userId = userId,
-                timestamp = System.currentTimeMillis(),
-                ecgData = filteredData,
-                heartRate = heartRate,
-                abnormalities = abnormalities
-            )
-            
-            // Send to WebSocket client
-            sendToClient(userId, packet)
-            
-            // Emit to flow for other subscribers
-            ecgDataFlow.emit(packet)
+        // Analyze for abnormalities using a larger context
+        val contextData = Array(DEFAULT_NUM_LEADS) { leadIndex ->
+            buffers[leadIndex].getLastN(PROCESSING_WINDOW)
         }
+        val abnormalities = analyzeForAbnormalities(contextData)
+        
+        // Calculate heart rate using all available data
+        val heartRate = calculateHeartRate(buffers[1].getAll())
+        
+        // Create a data packet with ONLY THE NEW DATA
+        val packet = EcgDataPacket(
+            userId = userId,
+            timestamp = System.currentTimeMillis(),
+            ecgData = dataToProcess, // Only the new data!
+            heartRate = heartRate,
+            abnormalities = abnormalities
+        )
+        
+        // Send to WebSocket client
+        sendToClient(userId, packet)
+        
+        // Emit to flow for other subscribers
+        ecgDataFlow.emit(packet)
     }
-    
-    /**
-     * Process incoming raw ECG data
-     * @param rawBytes The raw bytes from the ECG device
-     * @param userId User ID associated with this data
-     
-    suspend fun processIncomingData(rawBytes: ByteArray, userId: Long) = withContext(Dispatchers.IO) {
-        // Initialize buffer if needed
-        if (!dataBuffers.containsKey(userId)) {
-            val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
-            dataBuffers[userId] = buffers
-        }
-        
-        val buffers = dataBuffers[userId] ?: return@withContext
-        
-        // Decode the raw data into multi-lead format
-        val decodedData = decodeRawData(rawBytes)
-        
-        // Add to each lead's buffer
-        for (leadIndex in decodedData.indices) {
-            val leadData = decodedData[leadIndex]
-            for (sample in leadData) {
-                buffers[leadIndex].add(sample)
-            }
-        }
-        
-        // Process if we have enough data
-        if (buffers[0].size() >= PROCESSING_WINDOW) {
-            // Extract data from each lead for processing
-            val dataToProcess = Array(DEFAULT_NUM_LEADS) { leadIndex ->
-                buffers[leadIndex].getLastN(PROCESSING_WINDOW)
-            }
-            
-            // Apply filters to all leads
-            val filteredData = applyFilters(dataToProcess)
-            
-            // Analyze the data for abnormalities
-            val abnormalities = analyzeForAbnormalities(dataToProcess)
-            
-            // Calculate metrics using lead II (commonly used for rhythm analysis)
-            val heartRate = calculateHeartRate(buffers[1].getAll())
-            
-            // Create a data packet
-            val packet = EcgDataPacket(
-                userId = userId,
-                timestamp = System.currentTimeMillis(),
-                ecgData = filteredData,
-                heartRate = heartRate,
-                abnormalities = abnormalities
-            )
-            
-            // Send to WebSocket client
-            sendToClient(userId, packet)
-            
-            // Emit to flow for other subscribers
-            ecgDataFlow.emit(packet)
-        }
-    }*/
-
-    /**
-     * Get count of active sessions
-     */
-    fun getActiveSessionCount(): Int {
-        return activeSessions.size
-    }
-    
-    /**
-     * Get list of active user IDs
-     */
-    fun getActiveUserIds(): Set<Long> {
-        return activeSessions.keys
-    }
+}
     
     /**
      * Send ECG data to a specific user
      */
     suspend fun sendDirectPacket(userId: Long, packet: EcgDataPacket) {
-        val session = activeSessions[userId]
-        
-        if (session != null && session.isOpen) {
-            try {
-                val jsonMessage = objectMapper.writeValueAsString(packet)
-                withContext(Dispatchers.IO) {
-                    session.sendMessage(TextMessage(jsonMessage))
-                }
-                // Notify observers about successful send
-                diagnosticObservers.forEach { it.updateConnectionStats(userId, packet) }
-            } catch (e: Exception) {
-                logger.error("Error sending data to user $userId: ${e.message}")
-                throw e
-            }
-        } else {
-            logger.warn("Cannot send data: No active session for user $userId")
+        try {
+            val jsonMessage = objectMapper.writeValueAsString(packet)
+            ecgMessagePublisher.publishToUser(userId, jsonMessage)
+            
+            // Notify observers about successful send
+            diagnosticObservers.forEach { it.updateConnectionStats(userId, packet) }
+        } catch (e: Exception) {
+            logger.error("Error sending data to user $userId: ${e.message}")
+            throw e
         }
     }
 
     
-    /**
-     * Finalize an ECG recording session
-     * @param userId User ID
-     * @return The completed ECG recording or null if not enough data
-     */
+
     suspend fun finalizeRecording(userId: Long): EcgRecording? = withContext(Dispatchers.IO) {
-        val buffers = dataBuffers[userId] ?: return@withContext null
+        // Use the recording buffer that's been collecting data during the session
+        val recording = recordingBuffers[userId] ?: return@withContext null
         
-        if (buffers[0].size() < DEFAULT_SAMPLE_RATE) {
-            return@withContext null  // Not enough data to create a recording
+        // Check if we have enough data to create a recording
+        if (recording.isEmpty() || recording[0].size < DEFAULT_SAMPLE_RATE) {
+            logger.warn("Not enough data to create a recording for user $userId")
+            return@withContext null
         }
         
-        // Get all buffered data from each lead
+        logger.info("Finalizing recording for user $userId with ${recording[0].size} samples")
+        
+        // Convert ArrayList<Float> to FloatArray for each lead
         val allData = Array(DEFAULT_NUM_LEADS) { leadIndex ->
-            buffers[leadIndex].getAll()
+            recording[leadIndex].toFloatArray()
         }
         
         // Apply filters to the entire dataset
@@ -285,11 +203,8 @@ class RealtimeEcgService(
         
         // Get medical info
         val medicalInfo = medicalInfoRepo.findByUserId(userId)
-            ?: throw IllegalArgumentException("No medical info found for user ID $userId")
+            ?: return@withContext null 
             
-        // Convert multi-lead float data to byte array for storage
-        val rawDataBytes = allData.toByteArray()
-        
         // Calculate metrics using lead II
         val heartRate = calculateHeartRate(filteredData[1])
         val qrsComplexes = detectQrsComplexes(filteredData[1])
@@ -305,6 +220,18 @@ class RealtimeEcgService(
             "No significant abnormalities detected"
         }
         
+        // Extract max and min values for each lead and store them in separate arrays
+        val maxValues = FloatArray(filteredData.size) { leadIndex ->
+            filteredData[leadIndex].maxOrNull() ?: 1f
+        }
+        
+        val minValues = FloatArray(filteredData.size) { leadIndex ->
+            filteredData[leadIndex].minOrNull() ?: -1f
+        }
+        
+        // Use the 8-bit encoding function for efficient storage
+        val rawDataBytes = encodeEcgTo8Bit(filteredData)
+        
         // Convert qrsComplexes to JSON string format
         val qrsComplexesJson = qrsComplexesToJson(qrsComplexes)
         
@@ -318,17 +245,192 @@ class RealtimeEcgService(
             qrsComplexes = qrsComplexesJson,
             recordingDate = LocalDateTime.now(),
             medicalInfo = medicalInfo,
-            diagnosis = diagnosis
+            diagnosis = diagnosis,
+            maxValues = maxValues,  // Store max values for decoding
+            minValues = minValues,  // Store min values for decoding
+            numSamples = filteredData[0].size // Store sample count for decoding
         )
         
-        // Clear the buffers
-        for (buffer in buffers) {
-            buffer.clear()
-        }
+        // Reset the recording buffer for this user but keep it initialized
+        recordingBuffers[userId] = Array(DEFAULT_NUM_LEADS) { ArrayList<Float>() }
         
         ecgRecording
     }
     
+    /**
+     * Retrieve encoded ECG data and decode it back to Array<FloatArray>
+     */
+    fun retrieveAndDecodeEcg(recording: EcgRecording): Array<FloatArray>? {
+        val maxValues = recording.maxValues ?: return null
+        val minValues = recording.minValues ?: return null
+        
+        // Create maxMins list for the decoder in the format it expects
+        val maxMinsList = List(recording.numLeads) { leadIndex ->
+            Pair(maxValues[leadIndex], minValues[leadIndex])
+        }
+        
+        // Decode using the existing function
+        return decodeEcgFrom8Bit(
+            recording.rawData,
+            recording.numLeads,
+            recording.numSamples,
+            maxMinsList
+        )
+    }
+    /**
+     * Convert max/min values to JSON string for storage
+     */
+    private fun maxMinsToJson(maxMins: List<Pair<Float, Float>>): String {
+        return maxMins.joinToString(",") { (max, min) ->
+            "{\"max\":$max,\"min\":$min}"
+        }
+    }
+    
+    /**
+     * Parse max/min values from JSON string
+     */
+    private fun parseMaxMinsFromJson(json: String): List<Pair<Float, Float>> {
+        // Simple parsing - in production use a proper JSON parser
+        return json.split(",").map { pairStr ->
+            val max = pairStr.substringAfter("\"max\":").substringBefore(",").toFloat()
+            val min = pairStr.substringAfter("\"min\":").substringBefore("}").toFloat()
+            Pair(max, min)
+        }
+    }
+    /**
+ * Process raw binary ECG data received from TCP service
+ * Converts the raw data based on specified format, then passes to standard processData method
+ */
+    suspend fun processRawData(dataBuffer: ByteArray, format: TcpEcgReceiverService.DataFormat, userId: Long) = withContext(Dispatchers.IO) {
+        try {
+            // Process the raw data based on the format
+            val ecgData = when (format) {
+                TcpEcgReceiverService.DataFormat.FLOAT_MV -> processFloatFormat(dataBuffer)
+                TcpEcgReceiverService.DataFormat.SCALED_8BIT -> process8BitFormat(dataBuffer)
+                TcpEcgReceiverService.DataFormat.SCALED_7BIT -> process7BitFormat(dataBuffer)
+            }
+            
+            // Send the processed float data to the main processing function
+            if (ecgData != null) {
+                processData(ecgData, userId)
+            }
+        } catch (e: Exception) {
+            logger.error("Failed to process raw ECG data: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Process binary ECG data in float format (4 bytes per value)
+     */
+    private fun processFloatFormat(dataBuffer: ByteArray): Array<FloatArray>? {
+        try {
+            val buffer = ByteBuffer.wrap(dataBuffer).order(ByteOrder.LITTLE_ENDIAN)
+            
+            // For float format: 4 bytes per value * 12 leads = 48 bytes per sample
+            val bytesPerSample = 4 * DEFAULT_NUM_LEADS
+            
+            // Calculate actual number of complete samples
+            val numSamples = dataBuffer.size / bytesPerSample
+            if (numSamples == 0) return null
+            
+            // Create array to hold data
+            val ecgData = Array(DEFAULT_NUM_LEADS) { FloatArray(numSamples) }
+            
+            // Parse the binary data as float format
+            for (sampleIndex in 0 until numSamples) {
+                for (leadIndex in 0 until DEFAULT_NUM_LEADS) {
+                    try {
+                        val rawValue = buffer.getFloat()
+                        ecgData[leadIndex][sampleIndex] = rawValue // Direct float value in mV
+                    } catch (e: Exception) {
+                        // If we run out of buffer, just return what we have
+                        logger.warn("Buffer underflow at sample $sampleIndex, lead $leadIndex")
+                        return ecgData
+                    }
+                }
+            }
+            
+            logger.debug("Processed ${numSamples} samples of float ECG data")
+            return ecgData
+        } catch (e: Exception) {
+            logger.error("Error processing binary float ECG data: ${e.message}", e)
+            return null
+        }
+    }
+
+    /**
+     * Process 8-bit scaled ECG data
+     * Each lead's data is represented by a byte value between 0-255
+     */
+    private fun process8BitFormat(dataBuffer: ByteArray): Array<FloatArray>? {
+        try {
+            val bytesPerSample = DEFAULT_NUM_LEADS // 1 byte per lead
+            
+            // Calculate actual number of complete samples
+            val numSamples = dataBuffer.size / bytesPerSample
+            if (numSamples == 0) return null
+            
+            // Create array to hold data
+            val ecgData = Array(DEFAULT_NUM_LEADS) { FloatArray(numSamples) }
+            
+            // Parse the binary data as 8-bit format
+            for (sampleIndex in 0 until numSamples) {
+                for (leadIndex in 0 until DEFAULT_NUM_LEADS) {
+                    val byteIndex = sampleIndex * bytesPerSample + leadIndex
+                    if (byteIndex < dataBuffer.size) {
+                        val rawValue = dataBuffer[byteIndex].toInt() and 0xFF
+                        // Convert to mV: Center at 0 and scale to reasonable ECG range (typically +/- 1-2 mV)
+                        val CENTER_VALUE_8BIT = 127.5f
+                        val MAX_VALUE_8BIT = 255
+                        ecgData[leadIndex][sampleIndex] = (rawValue - CENTER_VALUE_8BIT) / (MAX_VALUE_8BIT / 2) * 1.0f
+                    }
+                }
+            }
+            
+            println("Processed ${numSamples} samples of 8-bit ECG data")
+            return ecgData
+        } catch (e: Exception) {
+            logger.error("Error processing 8-bit ECG data: ${e.message}", e)
+            return null
+        }
+    }
+
+    /**
+     * Process 7-bit scaled ECG data
+     * Each lead's data is represented by a byte value between 0-127
+     */
+    private fun process7BitFormat(dataBuffer: ByteArray): Array<FloatArray>? {
+        try {
+            val bytesPerSample = DEFAULT_NUM_LEADS // 1 byte per lead
+            
+            // Calculate actual number of complete samples
+            val numSamples = dataBuffer.size / bytesPerSample
+            if (numSamples == 0) return null
+            
+            // Create array to hold data
+            val ecgData = Array(DEFAULT_NUM_LEADS) { FloatArray(numSamples) }
+            
+            // Parse the binary data as 7-bit format
+            for (sampleIndex in 0 until numSamples) {
+                for (leadIndex in 0 until DEFAULT_NUM_LEADS) {
+                    val byteIndex = sampleIndex * bytesPerSample + leadIndex
+                    if (byteIndex < dataBuffer.size) {
+                        val rawValue = dataBuffer[byteIndex].toInt() and 0x7F // Mask to 7 bits
+                        // Convert to mV: Center at 0 and scale to reasonable ECG range
+                        val CENTER_VALUE_7BIT = 63.5f
+                        val MAX_VALUE_7BIT = 127
+                        ecgData[leadIndex][sampleIndex] = (rawValue - CENTER_VALUE_7BIT) / (MAX_VALUE_7BIT / 2) * 1.0f
+                    }
+                }
+            }
+            
+            logger.debug("Processed ${numSamples} samples of 7-bit ECG data")
+            return ecgData
+        } catch (e: Exception) {
+            logger.error("Error processing 7-bit ECG data: ${e.message}", e)
+            return null
+        }
+    }
     /**
      * Serialize processed multi-lead data for storage
      */
@@ -349,101 +451,135 @@ class RealtimeEcgService(
             } + "}"
         }
     }
+
+    fun encodeEcgTo8Bit(data: Array<FloatArray>): ByteArray {
+        val numLeads = data.size
+        val numSamples = data[0].size
+        val encoded = ByteArray(numLeads * numSamples)
+
+        for (lead in 0 until numLeads) {
+            val leadData = data[lead]
+            val max = leadData.maxOrNull() ?: 1f
+            val min = leadData.minOrNull() ?: -1f
+            val diff = max - min + 1e-6f
+            val avg = (max + min) / 2f
+            val scale = 255f / diff
+
+            for (i in leadData.indices) {
+                val normalized = (scale * (leadData[i] - avg) + 127.5f).toInt().coerceIn(0, 255)
+                encoded[lead * numSamples + i] = normalized.toByte()
+            }
+        }
+
+        return encoded
+    }
+
+
+    fun decodeEcgFrom8Bit(
+        encoded: ByteArray,
+        numLeads: Int,
+        numSamples: Int,
+        maxMins: List<Pair<Float, Float>>
+    ): Array<FloatArray> {
+        val decoded = Array(numLeads) { FloatArray(numSamples) }
+
+        for (lead in 0 until numLeads) {
+            val (max, min) = maxMins[lead]
+            val diff = max - min + 1e-6f
+            val avg = (max + min) / 2f
+            val scale = diff / 255f
+
+            for (i in 0 until numSamples) {
+                val byteVal = encoded[lead * numSamples + i].toInt() and 0xFF
+                decoded[lead][i] = ((byteVal - 127.5f) * scale) + avg
+            }
+        }
+
+        return decoded
+    }
     
     /**
      * Convert float arrays to byte array for storage
      */
     private fun Array<FloatArray>.toByteArray(): ByteArray {
-        // Calculate total size needed
-        var totalSize = 0
-        for (leadData in this) {
-            totalSize += leadData.size * 2 // 2 bytes per sample (16-bit)
-        }
-        
-        val buffer = ByteBuffer.allocate(totalSize)
-        buffer.order(ByteOrder.LITTLE_ENDIAN)
-        
-        // Store in lead-major format (all samples for lead 1, then all for lead 2, etc.)
-        for (leadData in this) {
-            for (value in leadData) {
-                // Convert back to raw ADC value
-                val adcValue = (value / MILLIVOLTS_PER_BIT).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                buffer.putShort(adcValue.toShort())
-            }
-        }
-        
-        return buffer.array()
+    // Calculate total size needed
+    var totalSize = 0
+    for (leadData in this) {
+        totalSize += 4 // 4 bytes to store the length of each lead array
+        totalSize += leadData.size * 4 // 4 bytes per float sample
     }
+    
+    // Add 4 bytes to store the total number of leads
+    totalSize += 4
+    
+    val buffer = ByteBuffer.allocate(totalSize)
+    buffer.order(ByteOrder.LITTLE_ENDIAN)
+    
+    // Store number of leads
+    buffer.putInt(this.size)
+    
+    // Store each lead data
+    for (leadData in this) {
+        // Store length of this lead's data
+        buffer.putInt(leadData.size)
+        
+        // Store each float value directly
+        for (value in leadData) {
+            buffer.putFloat(value)
+        }
+    }
+    
+    return buffer.array()
+}
     
     /**
      * Send processed data to WebSocket client
      */
+    // In RealtimeEcgService
+
     private suspend fun sendToClient(userId: Long, packet: EcgDataPacket) {
-        val session = activeSessions[userId] ?: return
-        
-        if (!session.isOpen) {
-            unregisterSession(userId)
-            return
-        }
-        
-        // Convert to JSON - optimized for direct use in frontend visualization
-        val json = buildString {
-            append("{")
-            append("\"timestamp\": ${packet.timestamp},")
-            append("\"heartRate\": ${packet.heartRate},")
+        try {
+            // Create the root JSON object
+            val dataJson = JSONObject()
+            dataJson.put("timestamp", packet.timestamp)
+            dataJson.put("heartRate", packet.heartRate)
             
-            // Add multi-lead data as direct arrays for easier frontend processing
-            append("\"leads\": {")
-            packet.ecgData.forEachIndexed { leadIndex, leadData ->
-                if (leadIndex > 0) append(",")
-                // Use lead number as key (1-based for standard ECG naming)
-                append("\"${leadIndex + 1}\": [${leadData.joinToString(",")}]")
+            // Create ecgData as a JSONArray of JSONArrays, matching your frontend expectations
+            val ecgDataArray = JSONArray()
+            
+            // Add each lead's data as a JSONArray element
+            for (leadData in packet.ecgData) {
+                val leadDataArray = JSONArray()
+                for (value in leadData) {
+                    leadDataArray.put(value)
+                }
+                ecgDataArray.put(leadDataArray)
             }
-            append("},")
+            
+            // Put the ecgData array into the main JSON object
+            dataJson.put("ecgData", ecgDataArray)
             
             // Add abnormalities
-            append("\"abnormalities\": {")
-            packet.abnormalities.entries.forEachIndexed { index, (key, value) ->
-                if (index > 0) append(",")
-                append("\"$key\": $value")
+            val abnormalitiesJson = JSONObject()
+            packet.abnormalities.forEach { (key, value) ->
+                abnormalitiesJson.put(key, value)
             }
-            append("}")
+            dataJson.put("abnormalities", abnormalitiesJson)
             
-            append("}")
+            // Send the data
+            val jsonMessage = dataJson.toString()
+            ecgMessagePublisher.publishToUser(userId, jsonMessage)
+            
+            // Log a short sample to keep logs clean
+            logger.debug("Sent ECG data for user $userId, HR: ${packet.heartRate}, sample size: ${packet.ecgData[0].size}")
+            
+            // Notify observers
+            diagnosticObservers.forEach { it.updateConnectionStats(userId, packet) }
+        } catch (e: Exception) {
+            logger.error("Failed to send ECG data to client: ${e.message}", e)
         }
-        
-        // Send via WebSocket
-        session.sendMessage(TextMessage(json))
-        
-        // Notify observers about successful send
-        diagnosticObservers.forEach { it.updateConnectionStats(userId, packet) }
     }
     
-    /**
-     * Decode raw byte data into multi-lead float arrays
-     */
-    private fun decodeRawData(data: ByteArray): Array<FloatArray> {
-        val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-        
-        // Determine number of samples per lead
-        val bytesPerValue = 2 // Assuming 16-bit (2 byte) values
-        val totalValues = data.size / bytesPerValue
-        val samplesPerLead = totalValues / DEFAULT_NUM_LEADS
-        
-        // Create multi-lead array structure
-        val decodedData = Array(DEFAULT_NUM_LEADS) { FloatArray(samplesPerLead) }
-        
-        // Read data in lead-major format (all samples for lead 1, then all for lead 2, etc.)
-        for (lead in 0 until DEFAULT_NUM_LEADS) {
-            for (sample in 0 until samplesPerLead) {
-                val rawValue = buffer.short
-                // Convert to millivolts
-                decodedData[lead][sample] = rawValue * MILLIVOLTS_PER_BIT
-            }
-        }
-        
-        return decodedData
-    }
 
     /**
      * Apply filters to clean the signal for all leads
@@ -760,51 +896,60 @@ class RealtimeEcgService(
     // Existing equals/hashCode methods...
 }
     
-    /**
-     * Circular buffer implementation for efficient storage of streaming data
-     */
-    class CircularBuffer<T>(private val capacity: Int) {
-        private val buffer = ArrayList<T>(capacity)
-        private var head = 0
-        private var size = 0
-        
-        fun add(item: T) {
-            if (size < capacity) {
-                buffer.add(item)
-                size++
-            } else {
-                buffer[head] = item
-                head = (head + 1) % capacity
-            }
-        }
-        
-        fun getAll(): FloatArray {
-            val result = FloatArray(size)
-            for (i in 0 until size) {
-                val index = (head + i) % capacity
-                result[i] = buffer[index] as Float
-            }
-            return result
-        }
-        
-        fun getLastN(n: Int): FloatArray {
-            val count = minOf(n, size)
-            val result = FloatArray(count)
-            
-            for (i in 0 until count) {
-                val index = (head + size - count + i) % capacity
-                result[i] = buffer[index] as Float
-            }
-            
-            return result
-        }
-        
-        fun size(): Int = size
-        
-        fun clear() {
-            buffer.clear()
-            head = 0
-            size = 0
+class CircularBuffer<T>(private val capacity: Int) {
+    private val buffer = ArrayList<T>(capacity)
+    private var head = 0
+    private var size = 0
+    
+    fun add(item: T) {
+        if (size < capacity) {
+            buffer.add(item)
+            size++
+        } else {
+            // Replace oldest item with new one
+            buffer[head] = item
+            head = (head + 1) % capacity
         }
     }
+    
+    fun getAll(): FloatArray {
+        if (size == 0) return FloatArray(0)
+        
+        val result = FloatArray(size)
+        for (i in 0 until size) {
+            val index = (head + i) % capacity
+            if (index < buffer.size) {
+                result[i] = buffer[index] as Float
+            }
+        }
+        return result
+    }
+    
+    fun getLastN(n: Int): FloatArray {
+        val count = minOf(n, size)
+        if (count == 0) return FloatArray(0)
+        
+        val result = FloatArray(count)
+        
+        // Important: Calculate the correct starting position for the last N elements
+        for (i in 0 until count) {
+            // If we want the last N elements, we need to start at (head + size - count)
+            val sourceIndex = (head + size - count + i) % capacity
+            if (sourceIndex < buffer.size) {
+                result[i] = buffer[sourceIndex] as Float
+            }
+        }
+        
+        return result
+    }
+    
+    fun size(): Int = size
+    
+    fun clear() {
+        buffer.clear()
+        head = 0
+        size = 0
+    }
+}
+
 }

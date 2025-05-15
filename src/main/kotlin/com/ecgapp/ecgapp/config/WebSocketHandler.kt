@@ -1,95 +1,122 @@
 package com.ecgapp.ecgapp.config
 
+import com.ecgapp.ecgapp.service.EcgMessagePublisher
 import com.ecgapp.ecgapp.service.RealtimeEcgService
-import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Component
 import org.springframework.web.socket.CloseStatus
 import org.springframework.web.socket.TextMessage
 import org.springframework.web.socket.BinaryMessage
 import org.springframework.web.socket.WebSocketSession
 import org.springframework.web.socket.handler.TextWebSocketHandler
-import org.springframework.http.ResponseEntity
-import org.springframework.web.bind.annotation.GetMapping
-import org.springframework.web.bind.annotation.RestController
 import java.util.concurrent.ConcurrentHashMap
 
-import org.slf4j.LoggerFactory
-
 @Component
-class EcgWebSocketHandler : TextWebSocketHandler() {
-    // Store all active WebSocket sessions
+class EcgWebSocketHandler : TextWebSocketHandler(), EcgMessagePublisher {
     private val sessions = ConcurrentHashMap<String, WebSocketSession>()
+    private val userIdToSessionId = ConcurrentHashMap<Long, String>()
     
     override fun afterConnectionEstablished(session: WebSocketSession) {
         // Store the session with its unique ID
         sessions[session.id] = session
-        println("WebSocket client connected: ${session.id}")
+        val userId = extractUserId(session)
+        if (userId != null) {
+            // Map user ID to session ID
+            userIdToSessionId[userId] = session.id
+            println("WebSocket client connected: ${session.id}, User ID: $userId")
+        } else {
+            println("WebSocket client connected without user ID: ${session.id}")
+        }
     }
     
     override fun afterConnectionClosed(session: WebSocketSession, status: CloseStatus) {
         // Remove the session when closed
         sessions.remove(session.id)
+        
+        // Find and remove the user ID mapping
+        val userId = extractUserId(session)
+        if (userId != null) {
+            userIdToSessionId.remove(userId)
+        }
+        
         println("WebSocket client disconnected: ${session.id}")
     }
+
+    private fun extractUserId(session: WebSocketSession): Long? {
+        // Extract from URL query parameters
+        val parameters = session.uri?.query?.split("&")?.associate { 
+            val parts = it.split("=")
+            if (parts.size == 2) parts[0] to parts[1] else it to ""
+        }
+        
+        val userIdStr = parameters?.get("userId")
+        return userIdStr?.toLongOrNull()
+    }
     
-    /**
-     * Send a string message to all connected clients
-     */
-    fun sendToAllClients(message: String) {
+    // EcgMessagePublisher implementation
+    override fun publishToUser(userId: Long, message: String) {
+        val sessionId = userIdToSessionId[userId] ?: return
+        sendToClient(sessionId, message)
+    }
+    
+    override fun publishToAll(message: String) {
+        sendToAllClients(message)
+    }
+    
+    override fun publishBinaryToUser(userId: Long, data: ByteArray) {
+        val sessionId = userIdToSessionId[userId] ?: return
+        sendToClient(sessionId, BinaryMessage(data))
+    }
+    
+    override fun publishBinaryToAll(data: ByteArray) {
+        sendToAllClients(BinaryMessage(data))
+    }
+    
+    // Original methods
+    private fun sendToAllClients(message: String) {
         val textMessage = TextMessage(message)
         sendMessageToAll(textMessage)
     }
     
-    /**
-     * Send a binary message to all connected clients
-     */
-    fun sendToAllClients(message: BinaryMessage) {
+    private fun sendToAllClients(message: BinaryMessage) {
         sendMessageToAll(message)
     }
     
-    /**
-     * Send message to a specific client by session ID
-     */
-    fun sendToClient(sessionId: String, message: String) {
+    private fun sendToClient(sessionId: String, message: String) {
         val session = sessions[sessionId] ?: return
         if (session.isOpen) {
             try {
                 session.sendMessage(TextMessage(message))
             } catch (e: Exception) {
                 println("Error sending message to client $sessionId: ${e.message}")
-                // Remove the session if it's in a bad state
                 sessions.remove(sessionId)
             }
         } else {
-            // Remove closed sessions
             sessions.remove(sessionId)
         }
     }
     
-    /**
-     * Send message to a specific client by session ID
-     */
-    fun sendToClient(sessionId: String, message: BinaryMessage) {
+    private fun sendToClient(sessionId: String, message: BinaryMessage) {
         val session = sessions[sessionId] ?: return
         if (session.isOpen) {
             try {
                 session.sendMessage(message)
             } catch (e: Exception) {
                 println("Error sending binary message to client $sessionId: ${e.message}")
-                // Remove the session if it's in a bad state
                 sessions.remove(sessionId)
             }
         } else {
-            // Remove closed sessions
             sessions.remove(sessionId)
         }
     }
+
+    fun publishEcgData(userId: Long, packet: RealtimeEcgService.EcgDataPacket) {
+        // Convert to JSON
+        val json = packet.toFrontendJson()
+        // Send to client
+        publishToUser(userId, json)  
+    }
     
-    /**
-     * Private helper method to send a message to all clients
-     */
     private fun sendMessageToAll(message: Any) {
-        // Create a copy of the sessions to avoid ConcurrentModificationException
         val sessionsCopy = HashMap(sessions)
         
         for ((sessionId, session) in sessionsCopy) {
@@ -102,11 +129,9 @@ class EcgWebSocketHandler : TextWebSocketHandler() {
                     }
                 } catch (e: Exception) {
                     println("Error sending message to client $sessionId: ${e.message}")
-                    // Remove the session if it's in a bad state
                     sessions.remove(sessionId)
                 }
             } else {
-                // Remove closed sessions
                 sessions.remove(sessionId)
             }
         }

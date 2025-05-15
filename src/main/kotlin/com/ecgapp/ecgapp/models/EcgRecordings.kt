@@ -10,7 +10,6 @@ data class EcgRecording(
     @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
     val id: Int = 0,
 
-    @Lob
     @Column(name = "raw_data", columnDefinition = "BYTEA")
     val rawData: ByteArray,
 
@@ -39,6 +38,15 @@ data class EcgRecording(
     @JoinColumn(name = "medical_info_id", nullable = false)
     @JsonBackReference // Child side of reference - will be excluded from serialization
     val medicalInfo: MedicalInfo,
+    // Store all max values together and all min values together
+    @Column(name = "max_values", columnDefinition = "float[]")
+    val maxValues: FloatArray?,
+    
+    @Column(name = "min_values", columnDefinition = "float[]")
+    val minValues: FloatArray,
+
+    @Column(name = "num_samples", nullable = false)
+    var numSamples: Int = 0,
 
     @OneToMany(mappedBy = "ecgRecording", cascade = [CascadeType.ALL], orphanRemoval = true)
     val warnings: List<Warning> = mutableListOf()
