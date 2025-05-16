@@ -6,6 +6,7 @@ import java.time.LocalDateTime
 import com.ecgapp.ecgapp.dto.RegisterRequest
 import com.ecgapp.ecgapp.dto.LoginRequest
 import com.ecgapp.ecgapp.dto.BasicResponse
+import com.ecgapp.ecgapp.dto.LoginResponse
 import org.springframework.stereotype.Service
 
 import org.springframework.security.core.context.SecurityContextHolder
@@ -44,16 +45,28 @@ class UserService(
         return BasicResponse("User registered successfully")
     }
 
-    fun login(request: LoginRequest): BasicResponse {
-        val user = userRepository.findByEmail(request.email)
-            ?: return BasicResponse("Invalid username or password")
-
-        return if (user.password == request.password) {
-            BasicResponse("Login successful")
-        } else {
-            BasicResponse("Invalid username or password")
-        }
+fun login(request: LoginRequest): LoginResponse {
+    val user = userRepository.findByEmail(request.email)
+    return if (user == null) {
+        LoginResponse(
+            success = false,
+            message = "Account doesn't exist",
+            userId = -1  // or any invalid id, since login failed
+        )
+    } else if (user.password == request.password) {
+        LoginResponse(
+            success = true,
+            message = "Login successful",
+            userId = user.id
+        )
+    } else {
+        LoginResponse(
+            success = false,
+            message = "Invalid username or password",
+            userId = -1
+        )
     }
+}
 
     fun getCurrentUser(): User {
         val email = SecurityContextHolder.getContext().authentication.name

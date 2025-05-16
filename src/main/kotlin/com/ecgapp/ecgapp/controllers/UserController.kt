@@ -6,6 +6,7 @@ import com.ecgapp.ecgapp.service.UserService
 import com.ecgapp.ecgapp.dto.RegisterRequest
 import com.ecgapp.ecgapp.dto.LoginRequest
 import com.ecgapp.ecgapp.dto.BasicResponse
+import com.ecgapp.ecgapp.dto.LoginResponse
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 
@@ -56,7 +57,7 @@ class UserController(
     }
 
     @PostMapping("/login")
-    fun login(@RequestBody request: LoginRequest): ResponseEntity<BasicResponse> {
+    fun login(@RequestBody request: LoginRequest): ResponseEntity<LoginResponse> {
         return ResponseEntity.ok(userService.login(request))
     }
 }

@@ -25,6 +25,7 @@ class EcgTestController : EcgDiagnosticObserver {
     private val activeConnections = ConcurrentHashMap<Long, ConnectionDiagnostics>()
     private val packetCounter = AtomicInteger(0)
     private val testInProgress = AtomicBoolean(false)
+
     
     // Register this controller as an observer after construction
     @PostConstruct
@@ -112,7 +113,7 @@ class EcgTestController : EcgDiagnosticObserver {
     /**
      * Enhanced diagnostic packet sender
      */
-    @PostMapping("/test/packet/{userId}")
+    /*@PostMapping("/test/packet/{userId}")
     fun sendTestPacket(
         @PathVariable userId: Long,
         @RequestParam(required = false, defaultValue = "75") heartRate: Int,
@@ -150,12 +151,14 @@ class EcgTestController : EcgDiagnosticObserver {
                 )
             }
             
-            val packet = EcgDataPacket(
+            val packet = EcgDataPacket (
                 userId,
                 System.currentTimeMillis(),
                 testData,
                 heartRate,
-                abnormalities
+                abnormalities,
+                sampleRate,
+                overlapPoints
             )
             
             // Collect pre-send diagnostics
@@ -217,11 +220,11 @@ class EcgTestController : EcgDiagnosticObserver {
             
             return ResponseEntity.internalServerError().body(result)
         }
-    }
+    }*/
     
     /**
      * Enhanced continuous test with progress tracking
-     */
+     
     @PostMapping("/test/continuous/{userId}")
     fun startContinuousTest(
         @PathVariable userId: Long,
@@ -289,12 +292,14 @@ class EcgTestController : EcgDiagnosticObserver {
                         
                         // Create and send packet
                         val packet = EcgDataPacket(
-                            userId,
-                            System.currentTimeMillis(),
-                            testData,
-                            heartRate,
-                            abnormalities
-                        )
+                                userId,
+                                System.currentTimeMillis(),
+                                testData,
+                                heartRate,
+                                abnormalities,
+                                sampleRate,
+                                overlapPoints
+                            )
                         
                         runBlocking {
                             realtimeEcgService.sendDirectPacket(userId, packet)
@@ -347,7 +352,7 @@ class EcgTestController : EcgDiagnosticObserver {
                 "error" to (e.message ?: "Unknown error")
             ))
         }
-    }
+    }*/
     
     /**
      * Enhanced connections endpoint with detailed diagnostics
