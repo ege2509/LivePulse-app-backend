@@ -1,5 +1,6 @@
 package com.ecgapp.ecgapp.service
 
+import com.ecgapp.ecgapp.service.RealtimeEcgService.EcgDataPacket
 /**
  * Interface for classes that need to observe ECG connection events and data
  * This breaks the circular dependency between RealtimeEcgService and EcgTestController

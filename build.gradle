@@ -39,6 +39,7 @@ dependencies {
 	implementation("com.google.code.gson:gson:2.10.1")
 	implementation 'org.reactivestreams:reactive-streams:1.0.4'
 	implementation("io.projectreactor:reactor-core:3.6.1")
+	implementation("org.springframework.boot:spring-boot-starter-webflux")
 	implementation 'org.json:json:20210307'
 	runtimeOnly 'org.postgresql:postgresql'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'

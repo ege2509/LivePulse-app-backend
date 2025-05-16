@@ -12,6 +12,8 @@ import org.springframework.http.codec.ServerSentEvent
 import org.springframework.web.bind.annotation.*
 import org.springframework.web.multipart.MultipartFile
 import java.time.format.DateTimeFormatter
+import com.ecgapp.ecgapp.dto.EcgRecordingDto
+import com.ecgapp.ecgapp.dto.toDto
 
 @RestController
 @RequestMapping("/api/ecg")
@@ -59,16 +61,24 @@ class EcgController(
         return ResponseEntity.ok(response)
     }
     
-    @GetMapping("/recording/{id}")
-    suspend fun getRecording(@PathVariable id: Long): ResponseEntity<EcgRecording> {
-        val recordings = ecgRecordingRepository.findByMedicalInfoId(id)
+    @GetMapping("/recordings/medical-info/{medicalInfoId}")
+    suspend fun getRecordingsByMedicalInfoId(@PathVariable medicalInfoId: Long): ResponseEntity<List<EcgRecording>> {
+        val recordings = ecgRecordingRepository.findByMedicalInfoId(medicalInfoId)
         if (recordings.isEmpty()) {
             return ResponseEntity.notFound().build()
         }
-            
-        return ResponseEntity.ok(recordings.first())
+        
+        return ResponseEntity.ok(recordings)
     }
-    
+
+    @GetMapping("/recording/{id}")
+    suspend fun getRecording(@PathVariable id: Long): ResponseEntity<EcgRecordingDto> {
+        val recording = ecgRecordingRepository.findById(id)
+            .orElse(null) ?: return ResponseEntity.notFound().build()
+
+        return ResponseEntity.ok(recording.toDto())
+    }
+            
     // Server-Sent Events endpoint for clients that can't use WebSockets
     @GetMapping("/monitor/{userId}", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])
     fun monitorEcg(@PathVariable userId: Long): Flow<ServerSentEvent<String>> {

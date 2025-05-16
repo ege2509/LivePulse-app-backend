@@ -15,9 +15,14 @@ class WebSocketConfig : WebSocketConfigurer {
     fun ecgWebSocketHandler(): EcgWebSocketHandler {
         return EcgWebSocketHandler()
     }
+    @Bean
+    fun replayWebSocketHandler(): EcgWebSocketHandler {
+        return EcgWebSocketHandler()
+    }
 
     override fun registerWebSocketHandlers(registry: WebSocketHandlerRegistry) {
         registry.addHandler(ecgWebSocketHandler(), "/ws/ecg")
-               .setAllowedOrigins("*")  // In production, restrict to your frontend domain
+               .setAllowedOrigins("*")
+        registry.addHandler(replayWebSocketHandler(), "/ws/replay")
+                .setAllowedOrigins("*")  // In production, restrict to your frontend domain
     }
-}

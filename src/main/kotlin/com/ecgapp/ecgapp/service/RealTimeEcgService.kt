@@ -82,86 +82,160 @@ class RealtimeEcgService(
 
 
     suspend fun processData(ecgData: Array<FloatArray>, userId: Long) = withContext(Dispatchers.IO) {
-    // Initialize buffer if needed
-    if (!dataBuffers.containsKey(userId)) {
-        val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
-        dataBuffers[userId] = buffers
-        
-        // Initialize recording buffer
-        recordingBuffers[userId] = Array(DEFAULT_NUM_LEADS) { ArrayList<Float>() }
-    }
-    
-    val buffers = dataBuffers[userId] ?: return@withContext
-    val recording = recordingBuffers[userId] ?: return@withContext
-    
-    // Keep track of how many new samples we've added
-    var samplesAdded = 0
-    
-    // Add data to each lead's buffer and recording
-    for (leadIndex in ecgData.indices) {
-        val leadData = ecgData[leadIndex]
-        samplesAdded = leadData.size // Assuming all leads have same size
-        
-        for (sample in leadData) {
-            // Add to circular buffer for real-time processing
-            buffers[leadIndex].add(sample)
+        // Initialize buffer if needed
+        if (!dataBuffers.containsKey(userId)) {
+            val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
+            dataBuffers[userId] = buffers
             
-            // Add to recording buffer for storage
-            recording[leadIndex].add(sample)
-            
-            // Limit recording size
-            val maxRecordingSize = 5 * 60 * DEFAULT_SAMPLE_RATE
-            if (recording[leadIndex].size > maxRecordingSize) {
-                recording[leadIndex].removeAt(0)
-            }
+            // Initialize recording buffer
+            recordingBuffers[userId] = Array(DEFAULT_NUM_LEADS) { ArrayList<Float>() }
         }
-    }
-    
-    // CRITICAL FIX: Only process if we have new data to process
-    if (samplesAdded > 0) {
-        // Extract ONLY THE NEW data points that were just added
-        // This is the key change to prevent duplicated or repeated waveforms
-        val dataToProcess = Array(DEFAULT_NUM_LEADS) { leadIndex ->
-            // Get only the most recent samples we just added
-            val recentData = FloatArray(samplesAdded)
-            val buffer = buffers[leadIndex]
-            val allData = buffer.getAll()
+        
+        val buffers = dataBuffers[userId] ?: return@withContext
+        val recording = recordingBuffers[userId] ?: return@withContext
+        
+        // Keep track of how many new samples we've added
+        var samplesAdded = 0
+        
+        // Add data to each lead's buffer and recording
+        for (leadIndex in ecgData.indices) {
+            val leadData = ecgData[leadIndex]
+            samplesAdded = leadData.size // Assuming all leads have same size
             
-            // Copy just the newest samples
-            for (i in 0 until samplesAdded) {
-                val index = allData.size - samplesAdded + i
-                if (index >= 0 && index < allData.size) {
-                    recentData[i] = allData[index]
+            for (sample in leadData) {
+                // Add to circular buffer for real-time processing
+                buffers[leadIndex].add(sample)
+                
+                // Add to recording buffer for storage
+                recording[leadIndex].add(sample)
+                
+                // Limit recording size
+                val maxRecordingSize = 5 * 60 * DEFAULT_SAMPLE_RATE
+                if (recording[leadIndex].size > maxRecordingSize) {
+                    recording[leadIndex].removeAt(0)
                 }
             }
-            recentData
         }
         
-        // Analyze for abnormalities using a larger context
-        val contextData = Array(DEFAULT_NUM_LEADS) { leadIndex ->
-            buffers[leadIndex].getLastN(PROCESSING_WINDOW)
+        // CRITICAL FIX: Only process if we have new data to process
+        if (samplesAdded > 0) {
+            // Extract ONLY THE NEW data points that were just added
+            val dataToProcess = Array(DEFAULT_NUM_LEADS) { leadIndex ->
+                // Get only the most recent samples we just added
+                val recentData = FloatArray(samplesAdded)
+                val buffer = buffers[leadIndex]
+                val allData = buffer.getAll()
+                
+                // Copy just the newest samples
+                for (i in 0 until samplesAdded) {
+                    val index = allData.size - samplesAdded + i
+                    if (index >= 0 && index < allData.size) {
+                        recentData[i] = allData[index]
+                    }
+                }
+                recentData
+            }
+            
+            // Apply filters to the new data segment
+            // This is a key enhancement to match finalizeRecording's approach
+            val filteredDataToProcess = applyFilters(dataToProcess)
+            
+            // Get a larger context window for better analysis
+            val contextData = Array(DEFAULT_NUM_LEADS) { leadIndex ->
+                buffers[leadIndex].getLastN(PROCESSING_WINDOW)
+            }
+            
+            // Apply filters to context data for more accurate analysis
+            val filteredContextData = applyFilters(contextData)
+            
+            // Analyze for abnormalities using the filtered context data
+            val abnormalities = analyzeForAbnormalities(filteredContextData)
+            
+            // Calculate heart rate using filtered data for better accuracy
+            val heartRate = calculateHeartRate(filteredContextData[1])
+            
+            // Create a data packet with ONLY THE NEW DATA
+            // Keep the packet structure exactly the same as before
+            val packet = EcgDataPacket(
+                userId = userId,
+                timestamp = System.currentTimeMillis(),
+                ecgData = filteredDataToProcess, // Use filtered data instead of raw
+                heartRate = heartRate,
+                abnormalities = abnormalities
+            )
+            
+            // Send to WebSocket client
+            sendToClient(userId, packet)
+            
+            // Emit to flow for other subscribers
+            ecgDataFlow.emit(packet)
+            
+            // Log detailed metrics for debugging/monitoring (optional)
+            if (logger.isDebugEnabled()) {
+                logDetailedMetrics(userId, filteredContextData, heartRate, abnormalities)
+            }
         }
-        val abnormalities = analyzeForAbnormalities(contextData)
-        
-        // Calculate heart rate using all available data
-        val heartRate = calculateHeartRate(buffers[1].getAll())
-        
-        // Create a data packet with ONLY THE NEW DATA
-        val packet = EcgDataPacket(
-            userId = userId,
-            timestamp = System.currentTimeMillis(),
-            ecgData = dataToProcess, // Only the new data!
-            heartRate = heartRate,
-            abnormalities = abnormalities
-        )
-        
-        // Send to WebSocket client
-        sendToClient(userId, packet)
-        
-        // Emit to flow for other subscribers
-        ecgDataFlow.emit(packet)
     }
-}
+
+    // New private helper method for logging detailed metrics
+    private fun logDetailedMetrics(userId: Long, filteredData: Array<FloatArray>, heartRate: Int, abnormalities: Map<String, Float>) {
+        // This doesn't change your code structure but gives you more insight
+        try {
+            val leadII = filteredData[1] // Most commonly used for rhythm analysis
+            
+            // Calculate signal quality
+            val noiseLevel = calculateNoiseLevel(leadII)
+            val signalQuality = if (noiseLevel < 0.05f) "Excellent" 
+                            else if (noiseLevel < 0.1f) "Good"
+                            else if (noiseLevel < 0.2f) "Fair"
+                            else "Poor"
+            
+            // Detect QRS complexes for additional metrics
+            val qrsComplexes = detectQrsComplexes(leadII)
+            
+            // Calculate average QRS duration
+            val avgQrsDuration = if (qrsComplexes.isNotEmpty()) {
+                val totalDuration = qrsComplexes.sumOf { 
+                    (it["sPoint"] ?: 0) - (it["qPoint"] ?: 0) 
+                }
+                (totalDuration.toFloat() / qrsComplexes.size / DEFAULT_SAMPLE_RATE * 1000).toInt()
+            } else 0
+            
+            // Most concerning abnormality
+            val topAbnormality = abnormalities.entries
+                .filter { it.value > 0.5f }
+                .maxByOrNull { it.value }
+            
+            // Log the detailed information
+            logger.debug("""
+                User $userId ECG Metrics:
+                - Heart Rate: $heartRate BPM
+                - Signal Quality: $signalQuality (noise: ${noiseLevel.format(2)})
+                - QRS Complexes: ${qrsComplexes.size} detected
+                - Avg QRS Duration: ${avgQrsDuration}ms
+                - Top Abnormality: ${topAbnormality?.key ?: "None"} (${topAbnormality?.value?.times(100)?.format(1)}%)
+            """.trimIndent())
+        } catch (e: Exception) {
+            logger.error("Error logging detailed metrics", e)
+        }
+    }
+
+    // Helper function to calculate noise level
+    private fun calculateNoiseLevel(data: FloatArray): Float {
+        if (data.size < 10) return 0f
+        
+        var sum = 0f
+        for (i in 2 until data.size) {
+            // Second derivative approximation (rate of change of slope)
+            val secondDerivative = data[i] - 2 * data[i-1] + data[i-2]
+            sum += abs(secondDerivative)
+        }
+        
+        return sum / (data.size - 2)
+    }
+
+    // Helper extension function for Float formatting
+    private fun Float.format(digits: Int): String = String.format("%.${digits}f", this)
     
     /**
      * Send ECG data to a specific user
