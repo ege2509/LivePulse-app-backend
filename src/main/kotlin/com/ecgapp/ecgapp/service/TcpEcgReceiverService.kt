@@ -7,6 +7,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import com.ecgapp.ecgapp.repository.MedicalInfoRepository
 import com.ecgapp.ecgapp.service.RealtimeEcgService
+import com.ecgapp.ecgapp.service.ActiveEcgUserService
 import org.springframework.web.socket.TextMessage
 import org.springframework.web.socket.BinaryMessage
 import com.ecgapp.ecgapp.config.EcgWebSocketHandler
@@ -32,7 +33,8 @@ class TcpEcgReceiverService(
     private val ecgRepo: EcgRecordingRepository,
     private val medicalInfoRepo: MedicalInfoRepository,
     private val realtimeEcgService: RealtimeEcgService,
-    private val messagePublisher: EcgMessagePublisher  // Use the interface instead of concrete class
+    private val messagePublisher: EcgMessagePublisher,
+    private val activeEcgUserService: ActiveEcgUserService 
 ) {
     // ECG server settings
     private val port = 9090 // TCP server port
@@ -77,7 +79,9 @@ class TcpEcgReceiverService(
             println("ECG device connected from ${socket.inetAddress.hostAddress}")
             
             // Generate anonymous user ID for this connection
-            val userId = 1
+            val userId = activeEcgUserService.getCurrentUserId() ?: ++anonymousUserIdCounter
+
+            println("Processing ECG data for user ID: $userId")
             
             // Emit connection event
             connectionFlow.emit(
@@ -85,7 +89,7 @@ class TcpEcgReceiverService(
                     deviceAddress = socket.inetAddress.hostAddress,
                     connectionTime = System.currentTimeMillis(),
                     connected = true,
-                    anonymousUserId = 1
+                    anonymousUserId = userId
                 )
             )
             
@@ -118,7 +122,7 @@ class TcpEcgReceiverService(
                             // Create the actual data buffer with only the bytes read
                             val dataBuffer = buffer.copyOfRange(0, bytesRead)
                             
-                            realtimeEcgService.processRawData(dataBuffer, dataFormat, 1)
+                            realtimeEcgService.processRawData(dataBuffer, dataFormat, userId)
                             
                         } catch (e: Exception) {
                             println("Error processing ECG data: ${e.message}")
@@ -134,7 +138,7 @@ class TcpEcgReceiverService(
                             deviceAddress = socket.inetAddress.hostAddress,
                             connectionTime = System.currentTimeMillis(),
                             connected = false,
-                            anonymousUserId = 1
+                            anonymousUserId = userId
                         )
                     )
                     

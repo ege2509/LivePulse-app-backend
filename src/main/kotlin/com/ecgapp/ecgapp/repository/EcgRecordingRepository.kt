@@ -9,6 +9,5 @@ import java.util.Optional
 interface EcgRecordingRepository : JpaRepository<EcgRecording, Long> {
     fun findByMedicalInfoId(medicalInfoUserId: Long): List<EcgRecording>
 
-    // Optional: add this explicitly if you want, but JpaRepository already provides it
-    override fun findById(id: Long): Optional<EcgRecording>
+    fun findById(id: Int): Optional<EcgRecording>
 }

@@ -25,7 +25,7 @@ class EcgController(
 
     private val dateFormatter = DateTimeFormatter.ISO_DATE_TIME
 
-        @PostMapping("/save-recording")
+    @PostMapping("/save-recording")
     suspend fun saveEcgRecording(@RequestParam userId: Long): ResponseEntity<Map<String, Any>> {
         // Call the finalizeRecording method from RealtimeEcgService
         val recording = realtimeEcgService.finalizeRecording(userId)
@@ -46,8 +46,8 @@ class EcgController(
     }
     
     @GetMapping("/recordings")
-    suspend fun getUserRecordings(@RequestParam userId: Long): ResponseEntity<List<Map<String, Any>>> {
-        val recordings = ecgRecordingRepository.findByMedicalInfoId(userId)
+    suspend fun getUserRecordings(@RequestParam medicalInfoId: Long): ResponseEntity<List<Map<String, Any>>> {
+        val recordings = ecgRecordingRepository.findByMedicalInfoId(medicalInfoId)
         
         val response = recordings.map { recording ->
             mapOf(
@@ -104,6 +104,31 @@ class EcgController(
                         .build()
                 }
             }
+    }
+
+    @DeleteMapping("/recording/{id}")
+    suspend fun deleteRecording(@PathVariable id: Long): ResponseEntity<Map<String, Any>> {
+        // Check if the recording exists
+        val existingRecording = ecgRecordingRepository.findById(id)
+        
+        if (existingRecording.isEmpty) {
+            return ResponseEntity.notFound().build()
+        }
+        
+        try {
+            // Delete the recording
+            ecgRecordingRepository.deleteById(id)
+            
+            return ResponseEntity.ok(mapOf(
+                "message" to "Recording deleted successfully",
+                "deletedId" to id
+            ))
+        } catch (exception: Exception) {
+            return ResponseEntity.internalServerError().body(mapOf(
+                "error" to "Failed to delete recording",
+                "message" to (exception.message ?: "Unknown error occurred")
+            ))
+        }
     }
     
 }

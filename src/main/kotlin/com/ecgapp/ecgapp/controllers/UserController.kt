@@ -4,6 +4,7 @@ import com.ecgapp.ecgapp.models.User
 import com.ecgapp.ecgapp.repository.UserRepository
 import com.ecgapp.ecgapp.service.UserService
 import com.ecgapp.ecgapp.dto.RegisterRequest
+import com.ecgapp.ecgapp.dto.RegisterResponse
 import com.ecgapp.ecgapp.dto.LoginRequest
 import com.ecgapp.ecgapp.dto.BasicResponse
 import com.ecgapp.ecgapp.dto.LoginResponse
@@ -52,7 +53,7 @@ class UserController(
     }
 
     @PostMapping("/register")
-    fun register(@RequestBody request: RegisterRequest): ResponseEntity<BasicResponse> {
+    fun register(@RequestBody request: RegisterRequest): ResponseEntity<RegisterResponse> {
         return ResponseEntity.ok(userService.register(request))
     }
 

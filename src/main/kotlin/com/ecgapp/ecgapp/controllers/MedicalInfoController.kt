@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity
 import org.springframework.http.HttpStatus
 import org.springframework.web.bind.annotation.*
 import com.ecgapp.ecgapp.dto.MedicalInfoRequest
+import com.ecgapp.ecgapp.dto.MedicalInfoDTO
 
 @RestController
 @RequestMapping("/users")
@@ -16,51 +17,85 @@ class MedicalInfoController(
     private val medicalInfoRepository: MedicalInfoRepository
 ) {
 
-
     @PostMapping("/{userId}/medical-info")
     fun createMedicalInfo(
         @PathVariable userId: Long,
         @RequestBody medicalInfoRequest: MedicalInfoRequest
     ): ResponseEntity<Any> {
-            val savedInfo = medicalInfoService.createMedicalInfo(
+        val savedInfo = medicalInfoService.createMedicalInfo(
             userId,
             medicalInfoRequest.bloodType,
             medicalInfoRequest.allergies,
             medicalInfoRequest.medications
         )
     
-    return if (savedInfo != null) {
-        ResponseEntity.status(HttpStatus.CREATED).body(savedInfo)
-    } else {
-        ResponseEntity.status(HttpStatus.CONFLICT)
-            .body(mapOf("error" to "Unable to create medical info. User may not exist or info already exists."))
+        return if (savedInfo != null) {
+            val dto = MedicalInfoDTO(
+                id = savedInfo.id,
+                userId = savedInfo.user.id,
+                bloodType = savedInfo.bloodType,
+                allergies = savedInfo.allergies,
+                medications = savedInfo.medications
+            )
+            ResponseEntity.status(HttpStatus.CREATED).body(dto)
+        } else {
+            ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(mapOf("error" to "Unable to create medical info. User may not exist or info already exists."))
+        }
     }
-}
 
     @GetMapping("/{userId}/medical-info")
     fun getMedicalInfo(@PathVariable userId: Long): ResponseEntity<Any> {
         val info = medicalInfoService.getMedicalInfoByUserId(userId)
-        return if (info != null) ResponseEntity.ok(info)
-        else ResponseEntity.notFound().build()
+        return if (info != null) {
+            val dto = MedicalInfoDTO(
+                id = info.id,
+                userId = info.user.id,
+                bloodType = info.bloodType,
+                allergies = info.allergies,
+                medications = info.medications
+            )
+            ResponseEntity.ok(dto)
+        } else {
+            ResponseEntity.notFound().build()
+        }
     }
 
     @GetMapping("/blood_type")
-    fun getBloodType(@RequestParam userId: Long): ResponseEntity<String> {
+    fun getBloodType(@RequestParam userId: Long): ResponseEntity<MedicalInfoDTO> {
         val info = medicalInfoService.getMedicalInfoByUserId(userId)
-        return if (info?.bloodType != null)
-            ResponseEntity.ok(info.bloodType)
-        else
+        return if (info != null) {
+            val dto = MedicalInfoDTO(
+                id = info.id, // Added missing id
+                userId = info.user.id,
+                bloodType = info.bloodType,
+                allergies = info.allergies,
+                medications = info.medications
+            )
+            ResponseEntity.ok(dto)
+        } else {
             ResponseEntity.notFound().build()
+        }
     }
 
     @PostMapping("/blood_type")
     fun setBloodType(
         @RequestParam userId: Long,
         @RequestParam bloodType: String
-    ): ResponseEntity<Any> {
+    ): ResponseEntity<MedicalInfoDTO> {
         val updated = medicalInfoService.updateBloodType(userId, bloodType)
-        return if (updated != null) ResponseEntity.ok(updated)
-        else ResponseEntity.notFound().build()
+        return if (updated != null) {
+            val dto = MedicalInfoDTO(
+                id = updated.id, // Added missing id
+                userId = updated.user.id,
+                bloodType = updated.bloodType,
+                allergies = updated.allergies,
+                medications = updated.medications
+            )
+            ResponseEntity.ok(dto)
+        } else {
+            ResponseEntity.notFound().build()
+        }
     }
 
     @GetMapping("/allergies")

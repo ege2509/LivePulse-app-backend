@@ -6,3 +6,11 @@ data class MedicalInfoRequest(
     val allergies: String? = null,
     val medications: String? = null
 )
+
+public data class MedicalInfoDTO(
+    val id: Long,
+    val userId: Long,
+    val bloodType: String?,
+    val allergies: String?,
+    val medications: String?
+)

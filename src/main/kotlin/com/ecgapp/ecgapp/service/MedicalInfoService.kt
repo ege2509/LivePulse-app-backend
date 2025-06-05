@@ -45,25 +45,34 @@ class MedicalInfoService(
         return medicalInfoRepository.save(updatedInfo)
     }
 
-    fun createMedicalInfo(userId: Long, bloodType: String?, allergies: String?, medications: String?): MedicalInfo? {
-        // Check if user exists
-        val user = userRepository.findById(userId).orElse(null) ?: return null
-        
-        // Check if medical info already exists for this user
-        val existingInfo = getMedicalInfoByUserId(userId)
-        if (existingInfo != null) {
-            return null // User already has medical info
+    fun createMedicalInfo(
+        userId: Long, 
+        bloodType: String?, 
+        allergies: String?, 
+        medications: String?
+    ): MedicalInfo? {
+        return try {
+            // Check if user exists
+            val user = userRepository.findById(userId).orElse(null) ?: return null
+            
+            // Check if medical info already exists for this user
+            val existingInfo = medicalInfoRepository.findByUserId(userId)
+            if (existingInfo != null) {
+                return null // Medical info already exists
+            }
+
+            // Create new medical info (can be empty for newly registered users)
+            val medicalInfo = MedicalInfo(
+                user = user,
+                bloodType = bloodType,
+                allergies = allergies,
+                medications = medications
+            )
+
+            medicalInfoRepository.save(medicalInfo)
+        } catch (e: Exception) {
+            null
         }
-        
-        // Create new medical info
-        val newMedicalInfo = MedicalInfo(
-            bloodType = bloodType,
-            allergies = allergies,
-            medications = medications,
-            user = user
-        )
-        
-        return medicalInfoRepository.save(newMedicalInfo)
     }
     
 }

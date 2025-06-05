@@ -2,10 +2,15 @@ package com.ecgapp.ecgapp.service
 
 import com.ecgapp.ecgapp.models.EcgRecording
 import com.ecgapp.ecgapp.models.MedicalInfo
+import kotlinx.coroutines.Job
 import com.ecgapp.ecgapp.repository.MedicalInfoRepository
 import com.ecgapp.ecgapp.service.TcpEcgReceiverService
+import com.ecgapp.ecgapp.models.Warning
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import org.json.JSONObject
+import kotlin.math.sqrt
 import org.json.JSONArray
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -21,6 +26,8 @@ import java.nio.ByteOrder
 import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
 import com.ecgapp.ecgapp.service.EcgMessagePublisher
+import com.ecgapp.ecgapp.repository.WarningRepository
+import com.ecgapp.ecgapp.repository.EcgRecordingRepository
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -31,15 +38,22 @@ import org.springframework.context.ApplicationEventPublisher
 class RealtimeEcgService(
     private val medicalInfoRepo: MedicalInfoRepository,
     @Autowired private val eventPublisher: ApplicationEventPublisher,
-    @Autowired private val ecgMessagePublisher: EcgMessagePublisher
+    @Autowired private val ecgMessagePublisher: EcgMessagePublisher,
+     @Autowired private val warningRepository: WarningRepository,
+     @Autowired private val ecgRecordingRepository: EcgRecordingRepository
 ) {
     // Other properties remain the same...
     private val logger = LoggerFactory.getLogger(RealtimeEcgService::class.java)
     private val objectMapper = ObjectMapper()
 
     private val recordingBuffers = ConcurrentHashMap<Long, Array<ArrayList<Float>>>()
+
+    private val lastHeartRates = mutableMapOf<Long, Int>()
+    private val lastAbnormalities = mutableMapOf<Long, Map<String, Float>>()
+    private val lastAnalysisTime = mutableMapOf<Long, Long>()
+    private val processingJobs = mutableMapOf<Long, Job>()
     
-    // Dependency injection for observers (replacing direct EcgTestController reference)
+    // Dependency injection for observers 
     private val diagnosticObservers = mutableListOf<EcgDiagnosticObserver>()
     
     // Register an observer
@@ -54,34 +68,44 @@ class RealtimeEcgService(
     
     // Common ECG constants
     companion object {
-        const val DEFAULT_SAMPLE_RATE = 400 // Hz - matching the dataset sample rate
-        const val DEFAULT_NUM_LEADS = 12 // Standard 12-lead ECG
+        const val DEFAULT_SAMPLE_RATE = 400 // Hz - matching the dataset's sample rate
+        const val DEFAULT_NUM_LEADS = 12 
         const val DEFAULT_DATA_RESOLUTION = 16 // bits
         const val MILLIVOLTS_PER_BIT = 0.001f // Same as EcgProcessingService
         
         // Buffer settings
         const val BUFFER_SIZE = 4000 // 10 seconds of data at 400Hz 
-        const val PROCESSING_WINDOW = 200 // Process in chunks of 500ms
+        const val PROCESSING_WINDOW = 50 // Process in chunks of 500ms
+
+        private const val DISPLAY_UPDATE_RATE = 30 // 30 FPS for smooth display
+        private const val HEART_RATE_UPDATE_INTERVAL = 500L // Update heart rate every 500ms
+        private const val ABNORMALITY_CHECK_INTERVAL = 1000L // Check abnormalities every 1 second
+        
+        private const val DISPLAY_WINDOW_MS = 200 // 0.5 seconds for display
+        private const val ANALYSIS_WINDOW_MS = 3000 // 2 seconds for analysis
+        private const val MAX_PROCESSING_TIME_MS = 16 // ~60 FPS target
+        
+        private const val OPTIMAL_BATCH_SIZE = 32 // Optimal batch size for processing
         
         // Abnormality types
         val ABNORMALITY_TYPES = listOf("1dAVb", "RBBB", "LBBB", "SB", "AF", "ST")
     }
     
     
-    // Buffer for each user's ECG data - now stores multi-lead data
+    // Buffer for each user's ECG data stores multi-lead data
     private val dataBuffers = ConcurrentHashMap<Long, Array<CircularBuffer<Float>>>()
     
     // Flow for broadcasting processed ECG data
     private val ecgDataFlow = MutableSharedFlow<EcgDataPacket>(replay = 0, extraBufferCapacity = 64)
     
     /**
-     * Get the shared flow of ECG data for subscribers
+     * Get the shared flow of ECG data 
      */
     fun getEcgDataFlow(): Flow<EcgDataPacket> = ecgDataFlow
     
 
 
-    suspend fun processData(ecgData: Array<FloatArray>, userId: Long) = withContext(Dispatchers.IO) {
+    suspend fun processData(ecgData: Array<FloatArray>, userId: Long) = withContext(Dispatchers.Default) {
         // Initialize buffer if needed
         if (!dataBuffers.containsKey(userId)) {
             val buffers = Array(DEFAULT_NUM_LEADS) { CircularBuffer<Float>(BUFFER_SIZE) }
@@ -89,6 +113,11 @@ class RealtimeEcgService(
             
             // Initialize recording buffer
             recordingBuffers[userId] = Array(DEFAULT_NUM_LEADS) { ArrayList<Float>() }
+            
+            // Initialize cached values
+            lastHeartRates[userId] = 70
+            lastAbnormalities[userId] = emptyMap()
+            lastAnalysisTime[userId] = 0L
         }
         
         val buffers = dataBuffers[userId] ?: return@withContext
@@ -117,106 +146,213 @@ class RealtimeEcgService(
             }
         }
         
-        // CRITICAL FIX: Only process if we have new data to process
+        // Only process if we have new data
         if (samplesAdded > 0) {
-            // Extract ONLY THE NEW data points that were just added
-            val dataToProcess = Array(DEFAULT_NUM_LEADS) { leadIndex ->
-                // Get only the most recent samples we just added
-                val recentData = FloatArray(samplesAdded)
-                val buffer = buffers[leadIndex]
-                val allData = buffer.getAll()
-                
-                // Copy just the newest samples
-                for (i in 0 until samplesAdded) {
-                    val index = allData.size - samplesAdded + i
-                    if (index >= 0 && index < allData.size) {
-                        recentData[i] = allData[index]
-                    }
-                }
-                recentData
-            }
+            val bufferSize = buffers[0].size()
+            val currentTime = System.currentTimeMillis()
             
-            // Apply filters to the new data segment
-            // This is a key enhancement to match finalizeRecording's approach
-            val filteredDataToProcess = applyFilters(dataToProcess)
+            // Always send display data immediately for smooth real-time view
+            sendDisplayData(ecgData, userId, bufferSize, samplesAdded)
             
-            // Get a larger context window for better analysis
-            val contextData = Array(DEFAULT_NUM_LEADS) { leadIndex ->
-                buffers[leadIndex].getLastN(PROCESSING_WINDOW)
-            }
-            
-            // Apply filters to context data for more accurate analysis
-            val filteredContextData = applyFilters(contextData)
-            
-            // Analyze for abnormalities using the filtered context data
-            val abnormalities = analyzeForAbnormalities(filteredContextData)
-            
-            // Calculate heart rate using filtered data for better accuracy
-            val heartRate = calculateHeartRate(filteredContextData[1])
-            
-            // Create a data packet with ONLY THE NEW DATA
-            // Keep the packet structure exactly the same as before
-            val packet = EcgDataPacket(
-                userId = userId,
-                timestamp = System.currentTimeMillis(),
-                ecgData = filteredDataToProcess, // Use filtered data instead of raw
-                heartRate = heartRate,
-                abnormalities = abnormalities
-            )
-            
-            // Send to WebSocket client
-            sendToClient(userId, packet)
-            
-            // Emit to flow for other subscribers
-            ecgDataFlow.emit(packet)
-            
-            // Log detailed metrics for debugging/monitoring (optional)
-            if (logger.isDebugEnabled()) {
-                logDetailedMetrics(userId, filteredContextData, heartRate, abnormalities)
+            // Check if we should run heavy analysis
+            if (shouldRunAnalysis(userId, bufferSize, currentTime)) {
+                runBackgroundAnalysis(userId, buffers, currentTime)
             }
         }
     }
+    
+    private suspend fun sendDisplayData(
+        ecgData: Array<FloatArray>, 
+        userId: Long, 
+        bufferSize: Int, 
+        samplesAdded: Int
+    ) {
+        // Use cached values for immediate display
+        val cachedHeartRate = lastHeartRates[userId] ?: 70
+        val cachedAbnormalities = lastAbnormalities[userId] ?: emptyMap()
+        
+        // Prepare display data (just the new samples, lightly filtered)
+        val displayData = Array(DEFAULT_NUM_LEADS) { leadIndex ->
+            // For display, just use the incoming data with minimal processing
+            ecgData[leadIndex]
+        }
+        
+        val packet = EcgDataPacket(
+            userId = userId,
+            timestamp = System.currentTimeMillis(),
+            ecgData = displayData,
+            heartRate = cachedHeartRate,
+            abnormalities = cachedAbnormalities
+        )
+        
+        // Send immediately for smooth display
+        sendToClient(userId, packet)
+        ecgDataFlow.emit(packet)
+        
+        logger.debug("Display data sent: ${samplesAdded} samples, HR: $cachedHeartRate")
+    }
+    
+    private fun shouldRunAnalysis(userId: Long, bufferSize: Int, currentTime: Long): Boolean {
+        val lastAnalysis = lastAnalysisTime[userId] ?: 0L
+        val timeSinceLastAnalysis = currentTime - lastAnalysis
+        
+        // Run analysis if:
+        // 1. We have enough data AND
+        // 2. Enough time has passed since last analysis
+        val hasEnoughData = bufferSize >= (DEFAULT_SAMPLE_RATE * ANALYSIS_WINDOW_MS / 1000)
+        val timeForAnalysis = timeSinceLastAnalysis >= HEART_RATE_UPDATE_INTERVAL
+        
+        return hasEnoughData && timeForAnalysis
+    }
+    
+    private fun runBackgroundAnalysis(
+        userId: Long, 
+        buffers: Array<CircularBuffer<Float>>, 
+        currentTime: Long
+    ) {
+        // Cancel any existing analysis job for this user
+        processingJobs[userId]?.cancel()
+        
+        // Start new background analysis
+        processingJobs[userId] = CoroutineScope(Dispatchers.Default).launch {
+            try {
+                val analysisWindowSize = minOf(
+                    buffers[0].size(), 
+                    (DEFAULT_SAMPLE_RATE * ANALYSIS_WINDOW_MS / 1000).toInt()
+                )
+                
+                // Extract analysis data
+                val contextData = Array(DEFAULT_NUM_LEADS) { leadIndex ->
+                    buffers[leadIndex].getLastN(analysisWindowSize)
+                }
+                
+                logger.debug("Background analysis started: window size = $analysisWindowSize samples")
+                
+                // Apply filters for analysis (if needed)
+                val filteredContextData = contextData // or applyFilters(contextData)
+                
+                // Calculate heart rate (runs more frequently)
+                val newHeartRate = calculateHeartRate(filteredContextData[1])
+                
+                // Check abnormalities (runs less frequently)
+                val newAbnormalities = if (shouldCheckAbnormalities(userId, currentTime)) {
+                    analyzeForAbnormalities(filteredContextData)
+                } else {
+                    lastAbnormalities[userId] ?: emptyMap()
+                }
+                
+                // Update cached values
+                lastHeartRates[userId] = newHeartRate
+                lastAbnormalities[userId] = newAbnormalities
+                lastAnalysisTime[userId] = currentTime
+                
+                logger.debug("Analysis completed: HR=$newHeartRate, abnormalities=${newAbnormalities.size}")
+                
+            } catch (e: Exception) {
+                logger.error("Background analysis failed for user $userId", e)
+            }
+        }
+    }
+    
+    private fun shouldCheckAbnormalities(userId: Long, currentTime: Long): Boolean {
+        val lastAbnormalityCheck = lastAnalysisTime[userId] ?: 0L
+        return (currentTime - lastAbnormalityCheck) >= ABNORMALITY_CHECK_INTERVAL
+    }
+    
+    // Helper method to create optimized display packets
+    private fun createOptimizedDisplayPacket(
+        newData: Array<FloatArray>,
+        userId: Long,
+        useSmoothing: Boolean = true
+    ): EcgDataPacket {
+        val processedData = if (useSmoothing) {
+            // Apply minimal smoothing for display only
+            Array(DEFAULT_NUM_LEADS) { leadIndex ->
+                applySmoothingFilter(newData[leadIndex])
+            }
+        } else {
+            newData
+        }
+        
+        return EcgDataPacket(
+            userId = userId,
+            timestamp = System.currentTimeMillis(),
+            ecgData = processedData,
+            heartRate = lastHeartRates[userId] ?: 70,
+            abnormalities = lastAbnormalities[userId] ?: emptyMap()
+        )
+    }
+    
+    // Lightweight smoothing filter for display
+    private fun applySmoothingFilter(data: FloatArray): FloatArray {
+        if (data.size < 3) return data
+        
+        val smoothed = FloatArray(data.size)
+        smoothed[0] = data[0]
+        
+        for (i in 1 until data.size - 1) {
+            // Simple 3-point moving average
+            smoothed[i] = (data[i - 1] + data[i] + data[i + 1]) / 3f
+        }
+        
+        smoothed[data.size - 1] = data[data.size - 1]
+        return smoothed
+    }
+    
+    // Cleanup method to call when user disconnects
+    fun cleanup(userId: Long) {
+        processingJobs[userId]?.cancel()
+        processingJobs.remove(userId)
+        lastHeartRates.remove(userId)
+        lastAbnormalities.remove(userId)
+        lastAnalysisTime.remove(userId)
+        dataBuffers.remove(userId)
+        recordingBuffers.remove(userId)
+    }
 
-    // New private helper method for logging detailed metrics
-    private fun logDetailedMetrics(userId: Long, filteredData: Array<FloatArray>, heartRate: Int, abnormalities: Map<String, Float>) {
-        // This doesn't change your code structure but gives you more insight
+    private fun logDetailedAnalysis(
+        userId: Long, 
+        filteredData: Array<FloatArray>, 
+        heartRate: Int, 
+        abnormalities: Map<String, Float>,
+        newSamples: Int,
+        analysisWindowSize: Int
+    ) {
         try {
             val leadII = filteredData[1] // Most commonly used for rhythm analysis
             
-            // Calculate signal quality
-            val noiseLevel = calculateNoiseLevel(leadII)
-            val signalQuality = if (noiseLevel < 0.05f) "Excellent" 
-                            else if (noiseLevel < 0.1f) "Good"
-                            else if (noiseLevel < 0.2f) "Fair"
-                            else "Poor"
+            // Calculate signal statistics
+            val mean = leadII.average().toFloat()
+            val maxVal = leadII.maxOrNull() ?: 0f
+            val minVal = leadII.minOrNull() ?: 0f
+            val range = maxVal - minVal
             
-            // Detect QRS complexes for additional metrics
-            val qrsComplexes = detectQrsComplexes(leadII)
+            // Detect R-peaks for validation
+            val rPeaks = detectRPeaks(leadII)
             
-            // Calculate average QRS duration
-            val avgQrsDuration = if (qrsComplexes.isNotEmpty()) {
-                val totalDuration = qrsComplexes.sumOf { 
-                    (it["sPoint"] ?: 0) - (it["qPoint"] ?: 0) 
-                }
-                (totalDuration.toFloat() / qrsComplexes.size / DEFAULT_SAMPLE_RATE * 1000).toInt()
-            } else 0
-            
-            // Most concerning abnormality
-            val topAbnormality = abnormalities.entries
-                .filter { it.value > 0.5f }
-                .maxByOrNull { it.value }
-            
-            // Log the detailed information
             logger.debug("""
-                User $userId ECG Metrics:
-                - Heart Rate: $heartRate BPM
-                - Signal Quality: $signalQuality (noise: ${noiseLevel.format(2)})
-                - QRS Complexes: ${qrsComplexes.size} detected
-                - Avg QRS Duration: ${avgQrsDuration}ms
-                - Top Abnormality: ${topAbnormality?.key ?: "None"} (${topAbnormality?.value?.times(100)?.format(1)}%)
+                === ECG Analysis Summary ===
+                User: $userId
+                New samples: $newSamples
+                Analysis window: $analysisWindowSize samples (${analysisWindowSize.toFloat() / DEFAULT_SAMPLE_RATE}s)
+                Lead II stats: mean=${mean.format(3)}, range=${range.format(3)} (${minVal.format(3)} to ${maxVal.format(3)})
+                R-peaks detected: ${rPeaks.size}
+                Heart rate: $heartRate BPM
+                Abnormalities: ${abnormalities.entries.filter { it.value > 0.1f }.map { "${it.key}=${it.value.format(2)}" }}
+                ==============================
             """.trimIndent())
+            
+            // Additional validation
+            if (rPeaks.isEmpty() && analysisWindowSize >= DEFAULT_SAMPLE_RATE) {
+                logger.warn("No R-peaks detected despite having ${analysisWindowSize} samples. Signal range: $range")
+                // Log a sample of the data for inspection
+                val sampleIndices = (0 until minOf(10, leadII.size)).map { it }
+                val sampleValues = sampleIndices.map { leadII[it].format(3) }
+                logger.warn("Lead II sample values: $sampleValues")
+            }
+            
         } catch (e: Exception) {
-            logger.error("Error logging detailed metrics", e)
+            logger.error("Error in detailed analysis logging", e)
         }
     }
 
@@ -234,8 +370,6 @@ class RealtimeEcgService(
         return sum / (data.size - 2)
     }
 
-    // Helper extension function for Float formatting
-    private fun Float.format(digits: Int): String = String.format("%.${digits}f", this)
     
     /**
      * Send ECG data to a specific user
@@ -256,16 +390,41 @@ class RealtimeEcgService(
     
 
     suspend fun finalizeRecording(userId: Long): EcgRecording? = withContext(Dispatchers.IO) {
-        // Use the recording buffer that's been collecting data during the session
-        val recording = recordingBuffers[userId] ?: return@withContext null
+        logger.info("=== FINALIZE RECORDING DEBUG ===")
+        logger.info("User ID: $userId")
+        logger.info("recordingBuffers contains userId: ${recordingBuffers.containsKey(userId)}")
         
-        // Check if we have enough data to create a recording
-        if (recording.isEmpty() || recording[0].size < DEFAULT_SAMPLE_RATE) {
-            logger.warn("Not enough data to create a recording for user $userId")
+        val recording = recordingBuffers[userId]
+        if (recording != null) {
+            logger.info("Recording array size: ${recording.size}")
+            logger.info("Lead sizes: ${recording.mapIndexed { i, list -> "Lead$i: ${list.size}" }}")
+        } else {
+            logger.error("Recording is null!")
             return@withContext null
         }
         
-        logger.info("Finalizing recording for user $userId with ${recording[0].size} samples")
+        // Check if we have enough data - FIXED VALIDATION LOGIC
+        val lead0Size = recording.getOrNull(0)?.size ?: 0
+        logger.info("Validation check - Lead 0 size: $lead0Size, Required: $DEFAULT_SAMPLE_RATE")
+        
+        if (recording.isEmpty()) {
+            logger.warn("Recording array is empty (no leads)")
+            return@withContext null
+        }
+        
+        if (lead0Size < DEFAULT_SAMPLE_RATE) {
+            logger.warn("Not enough data - Lead 0 size: $lead0Size < Required: $DEFAULT_SAMPLE_RATE")
+            return@withContext null
+        }
+        
+        logger.info("Validation passed! Finalizing recording for user $userId with $lead0Size samples")
+        
+        // Log first few values from each lead for debugging
+        for (i in recording.indices) {
+            if (recording[i].size > 0) {
+                logger.info("Lead $i first few values: ${recording[i].take(5)}")
+            }
+        }
         
         // Convert ArrayList<Float> to FloatArray for each lead
         val allData = Array(DEFAULT_NUM_LEADS) { leadIndex ->
@@ -273,7 +432,7 @@ class RealtimeEcgService(
         }
         
         // Apply filters to the entire dataset
-        val filteredData = applyFilters(allData)
+        val filteredData = allData
         
         // Get medical info
         val medicalInfo = medicalInfoRepo.findByUserId(userId)
@@ -325,10 +484,19 @@ class RealtimeEcgService(
             numSamples = filteredData[0].size // Store sample count for decoding
         )
         
+        logger.info("ECG recording created successfully with ${filteredData[0].size} samples")
+        
+        // SAVE THE ECG RECORDING FIRST TO GET THE ID
+        val savedEcgRecording = ecgRecordingRepository.save(ecgRecording)
+        logger.info("ECG recording saved with ID: ${savedEcgRecording.id}")
+        
+        // NOW SAVE ABNORMALITIES AS WARNINGS
+        saveAbnormalitiesAsWarnings(abnormalities, savedEcgRecording.id)
+        
         // Reset the recording buffer for this user but keep it initialized
         recordingBuffers[userId] = Array(DEFAULT_NUM_LEADS) { ArrayList<Float>() }
         
-        ecgRecording
+        savedEcgRecording
     }
     
     /**
@@ -437,37 +605,47 @@ class RealtimeEcgService(
      * Each lead's data is represented by a byte value between 0-255
      */
     private fun process8BitFormat(dataBuffer: ByteArray): Array<FloatArray>? {
-        try {
-            val bytesPerSample = DEFAULT_NUM_LEADS // 1 byte per lead
-            
-            // Calculate actual number of complete samples
-            val numSamples = dataBuffer.size / bytesPerSample
-            if (numSamples == 0) return null
-            
-            // Create array to hold data
-            val ecgData = Array(DEFAULT_NUM_LEADS) { FloatArray(numSamples) }
-            
-            // Parse the binary data as 8-bit format
-            for (sampleIndex in 0 until numSamples) {
-                for (leadIndex in 0 until DEFAULT_NUM_LEADS) {
-                    val byteIndex = sampleIndex * bytesPerSample + leadIndex
-                    if (byteIndex < dataBuffer.size) {
-                        val rawValue = dataBuffer[byteIndex].toInt() and 0xFF
-                        // Convert to mV: Center at 0 and scale to reasonable ECG range (typically +/- 1-2 mV)
-                        val CENTER_VALUE_8BIT = 127.5f
-                        val MAX_VALUE_8BIT = 255
-                        ecgData[leadIndex][sampleIndex] = (rawValue - CENTER_VALUE_8BIT) / (MAX_VALUE_8BIT / 2) * 1.0f
+    try {
+        val bytesPerSample = DEFAULT_NUM_LEADS // 1 byte per lead
+        
+        // Calculate actual number of complete samples
+        val numSamples = dataBuffer.size / bytesPerSample
+        if (numSamples == 0) return null
+        
+        // Create array to hold data
+        val ecgData = Array(DEFAULT_NUM_LEADS) { FloatArray(numSamples) }
+        
+        // Parse the binary data as 8-bit format with improved scaling
+        for (sampleIndex in 0 until numSamples) {
+            for (leadIndex in 0 until DEFAULT_NUM_LEADS) {
+                val byteIndex = sampleIndex * bytesPerSample + leadIndex
+                if (byteIndex < dataBuffer.size) {
+                    val rawValue = dataBuffer[byteIndex].toInt() and 0xFF
+                    
+                    // Improved scaling based on typical ECG amplitude ranges
+                    // Most ECG signals are in the range of ±2-5mV
+                    val normalizedValue = (rawValue - 127.5f) / 127.5f // Normalize to [-1, 1]
+                    
+                    // Scale to appropriate mV range based on lead type
+                    val scaleFactor = when (leadIndex) {
+                        0, 1, 2 -> 3.0f        // Limb leads (I, II, III): ±3mV
+                        3, 4, 5 -> 2.0f        // Augmented leads (aVR, aVL, aVF): ±2mV  
+                        6, 7, 8, 9, 10, 11 -> 4.0f  // Precordial leads (V1-V6): ±4mV
+                        else -> 2.5f
                     }
+                    
+                    ecgData[leadIndex][sampleIndex] = normalizedValue * scaleFactor
                 }
             }
-            
-            println("Processed ${numSamples} samples of 8-bit ECG data")
-            return ecgData
-        } catch (e: Exception) {
-            logger.error("Error processing 8-bit ECG data: ${e.message}", e)
-            return null
         }
+        
+        logger.debug("Processed ${numSamples} samples of 8-bit ECG data with improved scaling")
+        return ecgData
+    } catch (e: Exception) {
+        logger.error("Error processing 8-bit ECG data: ${e.message}", e)
+        return null
     }
+}
 
     /**
      * Process 7-bit scaled ECG data
@@ -655,282 +833,639 @@ class RealtimeEcgService(
     }
     
 
-    /**
-     * Apply filters to clean the signal for all leads
-     */
-    private fun applyFilters(data: Array<FloatArray>): Array<FloatArray> {
-        val filteredData = Array(data.size) { leadIndex ->
-            val leadData = data[leadIndex]
-            // Apply baseline filter, low-pass filter, and notch filter
-            applyNotchFilter(
-                applyLowPassFilter(
-                    applyHighPassFilter(leadData)
+        /**
+         * Apply filters to clean the signal for all leads
+         */
+    fun applyFilters(data: Array<FloatArray>): Array<FloatArray> {
+            return Array(data.size) { leadIndex ->
+                val leadData = data[leadIndex]
+                applyNotchFilter(
+                    applyLowPassFilter(
+                        applyHighPassFilter(leadData)
+                    )
                 )
-            )
+            }
         }
-        return filteredData
-    }
-    
-    /**
-     * High-pass filter to remove baseline wander (typically below 0.5Hz)
-     */
-    private fun applyHighPassFilter(data: FloatArray): FloatArray {
-        val filteredData = FloatArray(data.size)
-        val alpha = 0.995f // Filter coefficient
-        
-        filteredData[0] = data[0]
-        for (i in 1 until data.size) {
-            filteredData[i] = alpha * (filteredData[i-1] + data[i] - data[i-1])
+
+        /** High-pass filter to remove baseline wander (typically below 0.5Hz) */
+        private fun applyHighPassFilter(data: FloatArray): FloatArray {
+            val filteredData = FloatArray(data.size)
+            val alpha = 0.995f
+            filteredData[0] = data[0]
+            for (i in 1 until data.size) {
+                filteredData[i] = alpha * (filteredData[i - 1] + data[i] - data[i - 1])
+            }
+            return filteredData
         }
-        
-        return filteredData
-    }
-    
-    /**
-     * Low-pass filter to remove high-frequency noise
-     */
-    private fun applyLowPassFilter(data: FloatArray): FloatArray {
-        // Simple moving average filter
-        val windowSize = 5
-        val filteredData = FloatArray(data.size)
-        
-        for (i in data.indices) {
-            var sum = 0f
-            var count = 0
-            
-            for (j in maxOf(0, i - windowSize/2)..minOf(data.size - 1, i + windowSize/2)) {
-                sum += data[j]
-                count++
+
+        /** Low-pass filter to remove high-frequency noise */
+        private fun applyLowPassFilter(data: FloatArray): FloatArray {
+            val windowSize = 5
+            val filteredData = FloatArray(data.size)
+            for (i in data.indices) {
+                var sum = 0f
+                var count = 0
+                for (j in maxOf(0, i - windowSize / 2)..minOf(data.size - 1, i + windowSize / 2)) {
+                    sum += data[j]
+                    count++
+                }
+                filteredData[i] = sum / count
+            }
+            return filteredData
+        }
+
+        /** Notch filter to remove powerline interference (placeholder) */
+        private fun applyNotchFilter(data: FloatArray): FloatArray {
+            return data // placeholder - use DSP library in production
+        }
+
+        /** Calculate heart rate from the ECG signal */
+        fun calculateHeartRate(data: FloatArray): Int {
+            // Need at least 2 seconds of data for reliable heart rate calculation
+            if (data.size < DEFAULT_SAMPLE_RATE * 2) {
+                logger.debug("Insufficient data for heart rate calculation: ${data.size} samples (need ${DEFAULT_SAMPLE_RATE * 2})")
+                return 70
             }
             
-            filteredData[i] = sum / count
-        }
-        
-        return filteredData
-    }
-    
-    /**
-     * Notch filter to remove powerline interference (50/60 Hz)
-     */
-    private fun applyNotchFilter(data: FloatArray): FloatArray {
-        // Simplified notch filter implementation
-        // In a real application, consider using a proper DSP library
-        return data // Placeholder - implement proper notch filter as needed
-    }
-    
-    /**
-     * Calculate heart rate from the ECG signal
-     */
-    fun calculateHeartRate(data: FloatArray): Int {
-        if (data.size < DEFAULT_SAMPLE_RATE) {
-            return 70 // Default value if not enough data
-        }
-        
-        // Detect R peaks
-        val rPeaks = detectRPeaks(data)
-        
-        if (rPeaks.size < 2) {
-            return 70 // Default value if we can't calculate
-        }
-        
-        // Calculate average RR interval in samples
-        var totalRRInterval = 0.0
-        for (i in 1 until rPeaks.size) {
-            totalRRInterval += (rPeaks[i] - rPeaks[i-1])
-        }
-        
-        val avgRRInterval = totalRRInterval / (rPeaks.size - 1)
-        
-        // Convert to heart rate in BPM
-        // HR = 60 * sample_rate / RR_interval
-        return (60.0 * DEFAULT_SAMPLE_RATE / avgRRInterval).roundToInt()
-    }
-    
-    /**
-     * Detect R peaks in the ECG signal using a simple threshold algorithm
-     */
-    private fun detectRPeaks(data: FloatArray): List<Int> {
-        val rPeaks = mutableListOf<Int>()
-        val threshold = calculateThreshold(data)
-        val minDistance = DEFAULT_SAMPLE_RATE * 0.3 // Minimum 300ms between peaks
-        
-        var lastPeakIndex = -minDistance.toInt()
-        
-        for (i in 1 until data.size - 1) {
-            if (i - lastPeakIndex < minDistance) continue
+            val rPeaks = detectRPeaks(data)
+            logger.debug("Heart rate calculation: ${rPeaks.size} R-peaks in ${data.size} samples")
             
-            // Check if this point is a local maximum and above threshold
-            if (data[i] > threshold && data[i] > data[i-1] && data[i] > data[i+1]) {
-                rPeaks.add(i)
-                lastPeakIndex = i
+            if (rPeaks.size < 2) {
+                logger.debug("Insufficient R-peaks for heart rate calculation: ${rPeaks.size}")
+                return 70
             }
-        }
-        
-        return rPeaks
-    }
-    
-    /**
-     * Calculate adaptive threshold for R peak detection
-     */
-    private fun calculateThreshold(data: FloatArray): Float {
-        // Simple threshold calculation as a percentage of max amplitude
-        var max = 0f
-        for (sample in data) {
-            if (abs(sample) > max) {
-                max = abs(sample)
-            }
-        }
-        
-        return 0.6f * max // 60% of max amplitude is a common threshold
-    }
-    
-    /**
-     * Detect QRS complexes from the ECG signal
-     */
-    private fun detectQrsComplexes(data: FloatArray): List<Map<String, Int>> {
-        val qrsComplexes = mutableListOf<Map<String, Int>>()
-        val rPeaks = detectRPeaks(data)
-        
-        for (rPeak in rPeaks) {
-            // Find Q and S points around R peak
-            val qPoint = findQPoint(data, rPeak)
-            val sPoint = findSPoint(data, rPeak)
             
-            qrsComplexes.add(mapOf(
-                "qPoint" to qPoint,
-                "rPeak" to rPeak,
-                "sPoint" to sPoint
-            ))
+            // Calculate average RR interval
+            val rrIntervals = (1 until rPeaks.size).map { rPeaks[it] - rPeaks[it - 1] }
+            val avgRR = rrIntervals.average()
+            val heartRate = (60.0 * DEFAULT_SAMPLE_RATE / avgRR).roundToInt()
+            
+            // Validate heart rate is in reasonable range
+            val validatedHR = when {
+                heartRate < 30 -> 70 // Too low, likely detection error
+                heartRate > 220 -> 70 // Too high, likely detection error
+                else -> heartRate
+            }
+            
+            logger.debug("Heart rate: $validatedHR BPM (from ${rrIntervals.size} RR intervals, avg=${avgRR.toFloat().format(1)} samples)")
+            
+            return validatedHR
         }
+
+        // Updated detectRPeaks with better debugging
+        private fun detectRPeaks(data: FloatArray): List<Int> {
+            if (data.isEmpty()) return emptyList()
+            
+            val threshold = calculateThreshold(data)
+            val minDistance = (DEFAULT_SAMPLE_RATE * 0.3).toInt() // 300ms minimum between peaks
+            val rPeaks = mutableListOf<Int>()
+            var lastPeak = -minDistance
+            
+            logger.debug("R-peak detection: threshold=$threshold, minDistance=$minDistance, dataSize=${data.size}")
+            
+            for (i in 1 until data.size - 1) {
+                if (i - lastPeak < minDistance) continue
+                
+                // Peak detection: current value is greater than threshold and is a local maximum
+                if (data[i] > threshold && data[i] > data[i - 1] && data[i] > data[i + 1]) {
+                    rPeaks.add(i)
+                    lastPeak = i
+                }
+            }
+            
+            logger.debug("Found ${rPeaks.size} R-peaks at positions: ${rPeaks.take(5)}${if (rPeaks.size > 5) "..." else ""}")
+            
+            return rPeaks
+        }
+
+        // Updated threshold calculation with debugging
+        private fun calculateThreshold(data: FloatArray): Float {
+            val maxAbs = data.maxOf { abs(it) }
+            val threshold = 0.6f * maxAbs
+            
+            logger.debug("Threshold calculation: maxAbs=$maxAbs, threshold=$threshold")
+            
+            return threshold
+        }
+
+        // Helper extension function for Float formatting
+        private fun Float.format(digits: Int): String = String.format("%.${digits}f", this)
+
+        /** Detect QRS complexes */
+        private fun detectQrsComplexes(data: FloatArray): List<Map<String, Int>> {
+            return detectRPeaks(data).map { r ->
+                mapOf("qPoint" to findQPoint(data, r), "rPeak" to r, "sPoint" to findSPoint(data, r))
+            }
+        }
+
+        private fun findQPoint(data: FloatArray, rPeak: Int): Int {
+            val window = DEFAULT_SAMPLE_RATE / 10
+            val start = maxOf(0, rPeak - window)
+            var minIdx = rPeak
+            var minVal = data[rPeak]
+            for (i in rPeak - 1 downTo start) {
+                if (data[i] < minVal) {
+                    minVal = data[i]
+                    minIdx = i
+                } else if (data[i] > data[i + 1]) break
+            }
+            return minIdx
+        }
+
+        private fun findSPoint(data: FloatArray, rPeak: Int): Int {
+            val window = DEFAULT_SAMPLE_RATE / 10
+            val end = minOf(data.size - 1, rPeak + window)
+            var minIdx = rPeak
+            var minVal = data[rPeak]
+            for (i in rPeak + 1..end) {
+                if (data[i] < minVal) {
+                    minVal = data[i]
+                    minIdx = i
+                } else if (i < end && data[i] < data[i + 1]) break
+            }
+            return minIdx
+        }
+    private fun detectRSRPattern(lead: FloatArray, qrsComplex: Map<String, Int>): Boolean {
+        val qPoint = qrsComplex["qPoint"]!!
+        val rPeak = qrsComplex["rPeak"]!!
+        val sPoint = qrsComplex["sPoint"]!!
         
-        return qrsComplexes
-    }
-    
-    /**
-     * Find Q point (local minimum before R peak)
-     */
-    private fun findQPoint(data: FloatArray, rPeak: Int): Int {
-        val searchWindow = DEFAULT_SAMPLE_RATE / 10 // 100ms window
-        val startIdx = maxOf(0, rPeak - searchWindow)
+        // Look for R' (second R wave) after the S wave
+        val searchStart = sPoint
+        val searchEnd = minOf(lead.size - 1, qPoint + (DEFAULT_SAMPLE_RATE * 0.12).toInt())
         
-        var minIdx = rPeak
-        var minVal = data[rPeak]
+        var maxAfterS = lead[sPoint]
+        var rPrimeCandidate = -1
         
-        for (i in rPeak-1 downTo startIdx) {
-            if (data[i] < minVal) {
-                minVal = data[i]
-                minIdx = i
-            } else if (data[i] > data[i+1]) {
-                // Found a rising edge, this is our Q point
-                break
+        // Find the highest peak after S wave
+        for (i in searchStart + 3 until searchEnd) {
+            if (lead[i] > maxAfterS && lead[i] > lead[i-1] && lead[i] > lead[i+1]) {
+                maxAfterS = lead[i]
+                rPrimeCandidate = i
             }
         }
         
-        return minIdx
+        // R' should be significantly higher than S point and substantial compared to original R
+        val baseline = calculateBaseline(lead)
+        return rPrimeCandidate != -1 && 
+            maxAfterS > baseline + 0.1f && 
+            maxAfterS > lead[rPeak] * 0.3f // R' should be at least 30% of original R
     }
-    
-    /**
-     * Find S point (local minimum after R peak)
-     */
-    private fun findSPoint(data: FloatArray, rPeak: Int): Int {
-        val searchWindow = DEFAULT_SAMPLE_RATE / 10 // 100ms window
-        val endIdx = minOf(data.size - 1, rPeak + searchWindow)
+
+    /** Check for broad S-wave in leads V5, V6, I, aVL for RBBB */
+    private fun hasBroadSWave(lead: FloatArray, qrsComplexes: List<Map<String, Int>>): Boolean {
+        if (qrsComplexes.isEmpty()) return false
         
-        var minIdx = rPeak
-        var minVal = data[rPeak]
+        val qrs = qrsComplexes.first()
+        val rPeak = qrs["rPeak"]!!
+        val sPoint = qrs["sPoint"]!!
         
-        for (i in rPeak+1..endIdx) {
-            if (data[i] < minVal) {
-                minVal = data[i]
-                minIdx = i
-            } else if (i < endIdx && data[i] < data[i+1]) {
-                // Found a rising edge, this is our S point
-                break
-            }
-        }
+        // S-wave duration should be > 40ms (for V6, I) or > R-wave duration
+        val sWaveDuration = sPoint - rPeak
+        val rWaveDuration = rPeak - qrs["qPoint"]!!
         
-        return minIdx
+        val minDurationMs = DEFAULT_SAMPLE_RATE * 0.04 // 40ms
+        
+        return sWaveDuration > minDurationMs || sWaveDuration > rWaveDuration
     }
-    
-    /**
-     * Analyze ECG for possible abnormalities
-     * This uses basic algorithms for demonstration - a production app would use ML models
-     */
-    private fun analyzeForAbnormalities(data: Array<FloatArray>): Map<String, Float> {
-        val results = mutableMapOf<String, Float>()
+
+    /** Detect deep and broad S-wave in V1/V2 for LBBB */
+    private fun hasDeepBroadSWave(lead: FloatArray, qrsComplex: Map<String, Int>): Boolean {
+        val rPeak = qrsComplex["rPeak"]!!
+        val sPoint = qrsComplex["sPoint"]!!
         
-        // Initialize all abnormality types with zero probability
-        ABNORMALITY_TYPES.forEach { abnormality ->
-            results[abnormality] = 0.0f
-        }
+        val baseline = calculateBaseline(lead)
+        val sDepth = baseline - lead[sPoint]
+        val sDuration = sPoint - rPeak
         
-        // Basic analysis
-        val lead2Data = data[1] // Lead II is commonly used for rhythm analysis
-        val heartRate = calculateHeartRate(lead2Data)
+        // S-wave should be deep (>0.3mV equivalent) and broad
+        val minDepth = 0.3f //can  be  adjusted
+        val minDuration = DEFAULT_SAMPLE_RATE * 0.04 // 40ms
         
-        // Simple rule-based analysis examples:
-        // Sinus bradycardia - heart rate < 60 BPM
-        if (heartRate < 60) {
+        return sDepth > minDepth && sDuration > minDuration
+    }
+
+    /** Check if small r-wave is missing or smaller than normal in V1/V2 for LBBB */
+    private fun hasMissingOrSmallRWave(lead: FloatArray, qrsComplex: Map<String, Int>): Boolean {
+        val qPoint = qrsComplex["qPoint"]!!
+        val rPeak = qrsComplex["rPeak"]!!
+        
+        val baseline = calculateBaseline(lead)
+        val rAmplitude = lead[rPeak] - baseline
+        
+        // R-wave should be very small or absent (< 0.1mV equivalent)
+        val maxRAmplitude = 0.1f // can  be  adjusted
+        
+        return rAmplitude < maxRAmplitude
+    }
+
+    /** Check for broad, positive R-wave in V5/V6 for LBBB */
+    private fun hasBroadPositiveRWave(lead: FloatArray, qrsComplex: Map<String, Int>): Boolean {
+        val qPoint = qrsComplex["qPoint"]!!
+        val rPeak = qrsComplex["rPeak"]!!
+        val sPoint = qrsComplex["sPoint"]!!
+        
+        val baseline = calculateBaseline(lead)
+        val rAmplitude = lead[rPeak] - baseline
+        val rDuration = sPoint - qPoint // Approximation of R-wave width
+        
+        // R-wave should be positive and broad
+        val minAmplitude = 0.2f // can  be  adjusted
+        val minDuration = DEFAULT_SAMPLE_RATE * 0.06 // 60ms
+        
+        return rAmplitude > minAmplitude && rDuration > minDuration
+    }
+
+    /** Check for absent Q waves in leads I, V5, V6 for LBBB */
+    private fun hasAbsentQWaves(lead: FloatArray, qrsComplex: Map<String, Int>): Boolean {
+        val qPoint = qrsComplex["qPoint"]!!
+        val rPeak = qrsComplex["rPeak"]!!
+        
+        val baseline = calculateBaseline(lead)
+        val qDepth = baseline - lead[qPoint]
+        
+        // Q-wave should be absent or very small (< 0.04mV equivalent)
+        val maxQDepth = 0.04f // can  be  adjusted
+        
+        return qDepth < maxQDepth
+    }
+
+    /** Calculate approximate baseline from early part of signal */
+    private fun calculateBaseline(lead: FloatArray): Float {
+        val sampleSize = minOf(lead.size / 10, 100) // Use first 10% or 100 samples
+        return lead.take(sampleSize).average().toFloat()
+    }
+
+    /** Enhanced abnormality analysis with proper RBBB/LBBB detection */
+    fun analyzeForAbnormalities(data: Array<FloatArray>): Map<String, Float> {
+        val results = ABNORMALITY_TYPES.associateWith { 0.0f }.toMutableMap()
+        
+        println("=== ECG Analysis Debug ===")
+        println("Input data: ${data.size} leads")
+        
+        // Standard 12-lead ECG order: I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6
+        val leadI = if (data.size > 0) data[0] else FloatArray(0)
+        val leadII = if (data.size > 1) data[1] else FloatArray(0)
+        val leadV1 = if (data.size > 6) data[6] else FloatArray(0)
+        val leadV2 = if (data.size > 7) data[7] else FloatArray(0)
+        val leadV5 = if (data.size > 10) data[10] else FloatArray(0)
+        val leadV6 = if (data.size > 11) data[11] else FloatArray(0)
+
+        println("Lead sizes - I: ${leadI.size}, II: ${leadII.size}, V1: ${leadV1.size}, V2: ${leadV2.size}, V5: ${leadV5.size}, V6: ${leadV6.size}")
+
+        val heartRate = calculateHeartRate(leadII)
+        println("Heart Rate: $heartRate BPM")
+
+        // Sinus Bradycardia
+        if (heartRate < 65) {
             results["SB"] = 0.9f
+            println("✓ Sinus Bradycardia detected (HR: $heartRate)")
         }
-        
-        // Sinus tachycardia - heart rate > 100 BPM
+
+        // Sinus Tachycardia  
         if (heartRate > 100) {
             results["ST"] = 0.9f
+            println("✓ Sinus Tachycardia detected (HR: $heartRate)")
         }
+
+        // Get QRS complexes from Lead II for duration analysis
+        val qrsComplexes = detectQrsComplexes(leadII)
+        println("QRS complexes found in Lead II: ${qrsComplexes.size}")
         
-        // For RBBB - look for wide QRS in V1 (lead 7) and RSR' pattern
-        val qrsComplexes = detectQrsComplexes(data[1])
         if (qrsComplexes.isNotEmpty()) {
-            // Calculate QRS duration
-            val averageQrsDuration = qrsComplexes.map { 
+            val avgQrsDuration = qrsComplexes.map { 
                 it["sPoint"]!! - it["qPoint"]!! 
             }.average()
             
-            // QRS duration > 120ms (48 samples at 400Hz) suggests bundle branch block
-            if (averageQrsDuration > (DEFAULT_SAMPLE_RATE * 0.12)) {
-                // Look for specific patterns in different leads to differentiate RBBB vs LBBB
-                // This is simplified logic - real detection is more complex
+            val qrsDurationSeconds = avgQrsDuration / DEFAULT_SAMPLE_RATE
+            println("Average QRS duration: ${qrsDurationSeconds * 1000}ms (${avgQrsDuration} samples)")
+            
+            // Check if QRS is wide (≥0.12 seconds)
+            val isWideQRS = qrsDurationSeconds >= 0.12
+            println("Wide QRS (≥120ms): $isWideQRS")
+            
+            if (isWideQRS) {
+                println("\n--- RBBB Analysis ---")
+                // RBBB Detection
+                val v1Qrs = if (leadV1.isNotEmpty()) detectQrsComplexes(leadV1) else emptyList()
+                val v2Qrs = if (leadV2.isNotEmpty()) detectQrsComplexes(leadV2) else emptyList()
                 
-                // For RBBB: wide S wave in lead I and wide R' in V1
-                val leadI = data[0]
-                val leadV1 = data[6] // V1 is typically index 6 in 12-lead ECG
+                println("V1 QRS complexes: ${v1Qrs.size}")
+                println("V2 QRS complexes: ${v2Qrs.size}")
                 
-                var wideS = false
-                var rPrimePresent = false
+                var rbbbScore = 0f
                 
-                // Very basic detection - would need more sophisticated algorithms
-                // for accurate diagnosis
+                // Check for RSR' pattern in V1/V2
+                if (v1Qrs.isNotEmpty()) {
+                    val hasRSR = detectRSRPattern(leadV1, v1Qrs.first())
+                    println("V1 RSR' pattern: $hasRSR")
+                    if (hasRSR) {
+                        rbbbScore += 0.4f
+                        println("  → RBBB score +0.4 (V1 RSR')")
+                    }
+                }
+                if (v2Qrs.isNotEmpty()) {
+                    val hasRSR = detectRSRPattern(leadV2, v2Qrs.first())
+                    println("V2 RSR' pattern: $hasRSR")
+                    if (hasRSR) {
+                        rbbbScore += 0.3f
+                        println("  → RBBB score +0.3 (V2 RSR')")
+                    }
+                }
                 
-                if (wideS && rPrimePresent) {
-                    results["RBBB"] = 0.8f
+                // Check for broad S-wave in V5, V6, I
+                if (leadV5.isNotEmpty()) {
+                    val v5Qrs = detectQrsComplexes(leadV5)
+                    if (v5Qrs.isNotEmpty()) {
+                        val hasBroadS = hasBroadSWave(leadV5, v5Qrs)
+                        println("V5 broad S-wave: $hasBroadS")
+                        if (hasBroadS) {
+                            rbbbScore += 0.2f
+                            println("  → RBBB score +0.2 (V5 broad S)")
+                        }
+                    }
+                }
+                if (leadV6.isNotEmpty()) {
+                    val v6Qrs = detectQrsComplexes(leadV6)
+                    if (v6Qrs.isNotEmpty()) {
+                        val hasBroadS = hasBroadSWave(leadV6, v6Qrs)
+                        println("V6 broad S-wave: $hasBroadS")
+                        if (hasBroadS) {
+                            rbbbScore += 0.2f
+                            println("  → RBBB score +0.2 (V6 broad S)")
+                        }
+                    }
+                }
+                if (leadI.isNotEmpty()) {
+                    val iQrs = detectQrsComplexes(leadI)
+                    if (iQrs.isNotEmpty()) {
+                        val hasBroadS = hasBroadSWave(leadI, iQrs)
+                        println("Lead I broad S-wave: $hasBroadS")
+                        if (hasBroadS) {
+                            rbbbScore += 0.2f
+                            println("  → RBBB score +0.2 (Lead I broad S)")
+                        }
+                    }
+                }
+                
+                println("Total RBBB score: $rbbbScore (threshold: 0.6)")
+                if (rbbbScore >= 0.6f) {
+                    results["RBBB"] = minOf(0.9f, rbbbScore)
+                    println("✓ RBBB DETECTED with confidence: ${results["RBBB"]}")
+                }
+                
+                println("\n--- LBBB Analysis ---")
+                // LBBB Detection
+                var lbbbScore = 0f
+                
+                // Check for deep, broad S-wave in V1/V2
+                if (v1Qrs.isNotEmpty()) {
+                    val hasDeepS = hasDeepBroadSWave(leadV1, v1Qrs.first())
+                    println("V1 deep/broad S-wave: $hasDeepS")
+                    if (hasDeepS) {
+                        lbbbScore += 0.3f
+                        println("  → LBBB score +0.3 (V1 deep S)")
+                    }
+                }
+                if (v2Qrs.isNotEmpty()) {
+                    val hasDeepS = hasDeepBroadSWave(leadV2, v2Qrs.first())
+                    println("V2 deep/broad S-wave: $hasDeepS")
+                    if (hasDeepS) {
+                        lbbbScore += 0.2f
+                        println("  → LBBB score +0.2 (V2 deep S)")
+                    }
+                }
+                
+                // Check for missing/small r-wave in V1/V2
+                if (v1Qrs.isNotEmpty()) {
+                    val hasSmallR = hasMissingOrSmallRWave(leadV1, v1Qrs.first())
+                    println("V1 missing/small r-wave: $hasSmallR")
+                    if (hasSmallR) {
+                        lbbbScore += 0.2f
+                        println("  → LBBB score +0.2 (V1 small r)")
+                    }
+                }
+                
+                // Check for broad, positive R-wave in V5/V6
+                if (leadV5.isNotEmpty()) {
+                    val v5Qrs = detectQrsComplexes(leadV5)
+                    if (v5Qrs.isNotEmpty()) {
+                        val hasBroadR = hasBroadPositiveRWave(leadV5, v5Qrs.first())
+                        println("V5 broad positive R-wave: $hasBroadR")
+                        if (hasBroadR) {
+                            lbbbScore += 0.2f
+                            println("  → LBBB score +0.2 (V5 broad R)")
+                        }
+                    }
+                }
+                if (leadV6.isNotEmpty()) {
+                    val v6Qrs = detectQrsComplexes(leadV6)
+                    if (v6Qrs.isNotEmpty()) {
+                        val hasBroadR = hasBroadPositiveRWave(leadV6, v6Qrs.first())
+                        println("V6 broad positive R-wave: $hasBroadR")
+                        if (hasBroadR) {
+                            lbbbScore += 0.2f
+                            println("  → LBBB score +0.2 (V6 broad R)")
+                        }
+                    }
+                }
+                
+                // Check for absent Q waves in I, V5, V6
+                if (leadI.isNotEmpty()) {
+                    val iQrs = detectQrsComplexes(leadI)
+                    if (iQrs.isNotEmpty()) {
+                        val hasAbsentQ = hasAbsentQWaves(leadI, iQrs.first())
+                        println("Lead I absent Q-waves: $hasAbsentQ")
+                        if (hasAbsentQ) {
+                            lbbbScore += 0.1f
+                            println("  → LBBB score +0.1 (Lead I absent Q)")
+                        }
+                    }
+                }
+                if (leadV5.isNotEmpty()) {
+                    val v5Qrs = detectQrsComplexes(leadV5)
+                    if (v5Qrs.isNotEmpty()) {
+                        val hasAbsentQ = hasAbsentQWaves(leadV5, v5Qrs.first())
+                        println("V5 absent Q-waves: $hasAbsentQ")
+                        if (hasAbsentQ) {
+                            lbbbScore += 0.1f
+                            println("  → LBBB score +0.1 (V5 absent Q)")
+                        }
+                    }
+                }
+                if (leadV6.isNotEmpty()) {
+                    val v6Qrs = detectQrsComplexes(leadV6)
+                    if (v6Qrs.isNotEmpty()) {
+                        val hasAbsentQ = hasAbsentQWaves(leadV6, v6Qrs.first())
+                        println("V6 absent Q-waves: $hasAbsentQ")
+                        if (hasAbsentQ) {
+                            lbbbScore += 0.1f
+                            println("  → LBBB score +0.1 (V6 absent Q)")
+                        }
+                    }
+                }
+                
+                println("Total LBBB score: $lbbbScore (threshold: 0.6)")
+                if (lbbbScore >= 0.6f) {
+                    results["LBBB"] = minOf(0.9f, lbbbScore)
+                    println("✓ LBBB DETECTED with confidence: ${results["LBBB"]}")
                 }
             }
+        } else {
+            println("No QRS complexes detected in Lead II!")
         }
-        
-        // Check for first degree AV block - PR interval > 200ms
-        // Would require more sophisticated algorithms to accurately measure PR interval
-        
-        // Check for atrial fibrillation - irregular RR intervals, absence of P waves
-        val rPeaks = detectRPeaks(lead2Data)
+
+        println("\n--- Other Analysis ---")
+        // Atrial Fibrillation 
+        val rPeaks = detectRPeaks(leadII)
+        println("R-peaks detected: ${rPeaks.size}")
         if (rPeaks.size > 3) {
-            val rrIntervals = mutableListOf<Int>()
-            for (i in 1 until rPeaks.size) {
-                rrIntervals.add(rPeaks[i] - rPeaks[i-1])
-            }
-            
-            // Calculate irregularity (standard deviation / mean)
+            val rrIntervals = (1 until rPeaks.size).map { rPeaks[it] - rPeaks[it - 1] }
             val mean = rrIntervals.average()
-            val stdDev = rrIntervals.map { (it - mean) * (it - mean) }.average().let { Math.sqrt(it) }
-            val irregularity = stdDev / mean
-            
-            // High irregularity might suggest AF
-            if (irregularity > 0.1) {
+            val std = sqrt(rrIntervals.map { (it - mean) * (it - mean) }.average())
+            val variability = std / mean
+            println("RR variability: $variability (threshold: 0.1)")
+            if (variability > 0.1) {
                 results["AF"] = 0.7f
+                println("✓ Atrial Fibrillation detected")
+            }
+        }
+
+        // 1st-Degree AV Block (existing logic)
+        val prInterval = detectPrInterval(leadII)
+        val prIntervalMs = (prInterval.toFloat() / DEFAULT_SAMPLE_RATE) * 1000
+        println("PR interval: ${prIntervalMs}ms (threshold: 200ms)")
+        if (prInterval > DEFAULT_SAMPLE_RATE * 0.2) {
+            results["1dAVB"] = 0.85f
+            println("✓ 1st-degree AV Block detected")
+        }
+
+        println("\n=== Final Results ===")
+        results.forEach { (condition, confidence) ->
+            if (confidence > 0) {
+                println("$condition: ${(confidence * 100).toInt()}%")
+            }
+        }
+        println("========================\n")
+
+        return results
+    }
+
+
+    private suspend fun saveAbnormalitiesAsWarnings(
+        abnormalities: Map<String, Float>,
+        ecgRecordingId: Int
+    ) = withContext(Dispatchers.IO) {
+        logger.info("=== SAVING ABNORMALITIES AS WARNINGS ===")
+        logger.info("ECG Recording ID: $ecgRecordingId")
+        logger.info("Abnormalities found: ${abnormalities.size}")
+        
+        val warningsToSave = mutableListOf<Warning>()
+
+        val ecgRecording = ecgRecordingRepository.findById(ecgRecordingId).orElseThrow { IllegalArgumentException("ECG Recording not found with ID: $ecgRecordingId") }
+        
+        // Define severity thresholds and warning details
+        val abnormalityDetails = mapOf(
+            "1dAVb" to WarningInfo("First-degree AV Block", "Prolonged PR interval detected"),
+            "RBBB" to WarningInfo("Right Bundle Branch Block", "Delayed conduction in right bundle branch"),
+            "LBBB" to WarningInfo("Left Bundle Branch Block", "Delayed conduction in left bundle branch"),
+            "SB" to WarningInfo("Sinus Bradycardia", "Heart rate below normal range"),
+            "AF" to WarningInfo("Atrial Fibrillation", "Irregular heart rhythm detected"),
+            "ST" to WarningInfo("Sinus Tachycardia", "Heart rate above normal range")
+        )
+        
+        abnormalities.forEach { (abnormalityType, confidence) ->
+            logger.info("Processing abnormality: $abnormalityType with confidence: $confidence")
+            
+            // Only save warnings for abnormalities with significant confidence
+            if (confidence > 0.1f) { // Threshold for saving warnings
+                val warningInfo = abnormalityDetails[abnormalityType]
+                if (warningInfo != null) {
+                    val warningType = determineWarningType(abnormalityType, confidence)
+                    val details = createWarningDetails(abnormalityType, confidence, warningInfo.description)
+                    
+                    val warning = Warning(
+                        type = warningType,
+                        details = details,
+                        ecgRecording = ecgRecording
+                    )
+                    
+                    warningsToSave.add(warning)
+                    logger.info("Created warning: type=$warningType, details=$details")
+                } else {
+                    logger.warn("No warning info found for abnormality type: $abnormalityType")
+                }
+            } else {
+                logger.debug("Skipping abnormality $abnormalityType (confidence too low: $confidence)")
             }
         }
         
-        return results
+        // Save all warnings in batch
+        if (warningsToSave.isNotEmpty()) {
+            try {
+                val savedWarnings = warningRepository.saveAll(warningsToSave)
+                logger.info("Successfully saved ${savedWarnings.size} warnings for ECG recording $ecgRecordingId")
+                
+                // Log details of saved warnings
+                savedWarnings.forEach { warning ->
+                    logger.info("Saved warning ID: ${warning.id}, Type: ${warning.type}, Details: ${warning.details}")
+                }
+            } catch (e: Exception) {
+                logger.error("Failed to save warnings for ECG recording $ecgRecordingId", e)
+                throw e
+            }
+        } else {
+            logger.info("No warnings to save (no significant abnormalities detected)")
+        }
+    }
+    
+    /**
+     * Determine warning type based on abnormality and confidence level
+     */
+    private fun determineWarningType(abnormalityType: String, confidence: Float): String {
+        return when {
+            confidence >= 0.8f -> "CRITICAL"
+            confidence >= 0.6f -> "HIGH"
+            confidence >= 0.4f -> "MEDIUM"
+            confidence >= 0.2f -> "LOW"
+            else -> "INFO"
+        }
+    }
+    
+    private fun createWarningDetails(
+        abnormalityType: String,
+        confidence: Float,
+        description: String
+    ): String {
+        val confidencePercentage = (confidence * 100).roundToInt()
+        return "$description (Confidence: ${confidencePercentage}%)"
+    }
+    
+    private data class WarningInfo(
+        val name: String,
+        val description: String
+    )
+    
+
+    // Additional debug helper functions
+    private fun debugQrsComplex(lead: FloatArray, qrs: Map<String, Int>, leadName: String) {
+        val qPoint = qrs["qPoint"]!!
+        val rPeak = qrs["rPeak"]!!
+        val sPoint = qrs["sPoint"]!!
+        
+        println(String.format(
+            "%s QRS - Q:%d(%.3f) R:%d(%.3f) S:%d(%.3f)",
+            leadName, qPoint, lead[qPoint], rPeak, lead[rPeak], sPoint, lead[sPoint]
+            ))
+    }
+
+
+    fun detectPrInterval(lead: FloatArray): Int {
+        val rPeaks = detectRPeaks(lead)
+        if (rPeaks.isEmpty()) return 0
+        val firstR = rPeaks.first()
+        val pStartEstimate = (firstR - DEFAULT_SAMPLE_RATE * 0.2).toInt().coerceAtLeast(0)
+        return firstR - pStartEstimate
     }
     
     /**

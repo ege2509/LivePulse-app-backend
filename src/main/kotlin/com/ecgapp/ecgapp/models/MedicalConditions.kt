@@ -27,6 +27,6 @@ data class MedicalCondition(
     
     @ManyToOne
     @JoinColumn(name = "medical_info_id", nullable = false)
-    @JsonBackReference // Child side of reference - will be excluded from serialization
+    @JsonBackReference 
     val medicalInfo: MedicalInfo
 )

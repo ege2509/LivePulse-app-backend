@@ -2,6 +2,7 @@ package com.ecgapp.ecgapp.config
 
 import com.ecgapp.ecgapp.service.EcgMessagePublisher
 import com.ecgapp.ecgapp.service.RealtimeEcgService
+import com.ecgapp.ecgapp.service.ActiveEcgUserService
 import org.springframework.stereotype.Component
 import org.springframework.web.socket.CloseStatus
 import org.springframework.web.socket.TextMessage
@@ -11,7 +12,9 @@ import org.springframework.web.socket.handler.TextWebSocketHandler
 import java.util.concurrent.ConcurrentHashMap
 
 @Component
-class EcgWebSocketHandler : TextWebSocketHandler(), EcgMessagePublisher {
+class EcgWebSocketHandler(
+    private val activeEcgUserService: ActiveEcgUserService
+) : TextWebSocketHandler(), EcgMessagePublisher {
     private val sessions = ConcurrentHashMap<String, WebSocketSession>()
     private val userIdToSessionId = ConcurrentHashMap<Long, String>()
     
@@ -22,6 +25,10 @@ class EcgWebSocketHandler : TextWebSocketHandler(), EcgMessagePublisher {
         if (userId != null) {
             // Map user ID to session ID
             userIdToSessionId[userId] = session.id
+            
+            // Set this user as the active ECG user
+            activeEcgUserService.setActiveUser(userId)
+            
             println("WebSocket client connected: ${session.id}, User ID: $userId")
         } else {
             println("WebSocket client connected without user ID: ${session.id}")
@@ -36,6 +43,11 @@ class EcgWebSocketHandler : TextWebSocketHandler(), EcgMessagePublisher {
         val userId = extractUserId(session)
         if (userId != null) {
             userIdToSessionId.remove(userId)
+            
+            // Clear the active user if this was the active user
+            if (activeEcgUserService.getCurrentUserId() == userId) {
+                activeEcgUserService.clearActiveUser()
+            }
         }
         
         println("WebSocket client disconnected: ${session.id}")
@@ -49,7 +61,7 @@ class EcgWebSocketHandler : TextWebSocketHandler(), EcgMessagePublisher {
         }
         
         val userIdStr = parameters?.get("userId")
-        return userIdStr?.toLongOrNull()
+        return userIdStr?.toLongOrNull()?.takeIf { it > 0 } // Return null if userId is -1 or invalid
     }
     
     // EcgMessagePublisher implementation
@@ -71,7 +83,7 @@ class EcgWebSocketHandler : TextWebSocketHandler(), EcgMessagePublisher {
         sendToAllClients(BinaryMessage(data))
     }
     
-    // Original methods
+    
     private fun sendToAllClients(message: String) {
         val textMessage = TextMessage(message)
         sendMessageToAll(textMessage)

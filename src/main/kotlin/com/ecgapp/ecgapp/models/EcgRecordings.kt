@@ -3,6 +3,8 @@ package com.ecgapp.ecgapp.models
 import jakarta.persistence.*
 import java.time.LocalDateTime
 import com.fasterxml.jackson.annotation.JsonBackReference
+import com.fasterxml.jackson.annotation.JsonManagedReference
+import com.fasterxml.jackson.annotation.JsonIgnore
 
 @Entity
 @Table(name = "ecg_recordings")
@@ -48,7 +50,8 @@ data class EcgRecording(
     @Column(name = "num_samples", nullable = false)
     var numSamples: Int = 0,
 
-    @OneToMany(mappedBy = "ecgRecording", cascade = [CascadeType.ALL], orphanRemoval = true)
+    @OneToMany(mappedBy = "ecgRecording", cascade = [CascadeType.ALL], fetch = FetchType.LAZY)
+    @JsonManagedReference
     val warnings: List<Warning> = mutableListOf()
 ) {
     override fun equals(other: Any?): Boolean {

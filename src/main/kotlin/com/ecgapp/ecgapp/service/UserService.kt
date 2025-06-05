@@ -4,6 +4,7 @@ import com.ecgapp.ecgapp.models.User
 import com.ecgapp.ecgapp.repository.UserRepository
 import java.time.LocalDateTime
 import com.ecgapp.ecgapp.dto.RegisterRequest
+import com.ecgapp.ecgapp.dto.RegisterResponse
 import com.ecgapp.ecgapp.dto.LoginRequest
 import com.ecgapp.ecgapp.dto.BasicResponse
 import com.ecgapp.ecgapp.dto.LoginResponse
@@ -15,7 +16,8 @@ import org.springframework.security.core.userdetails.UsernameNotFoundException
 
 @Service
 class UserService(
-    private val userRepository: UserRepository
+    private val userRepository: UserRepository,
+    private val medicalInfoService: MedicalInfoService
 ) {
 
     fun getUserByEmail(email: String): User? {
@@ -26,25 +28,43 @@ class UserService(
         return userRepository.save(user)
     }
 
-    fun register(request: RegisterRequest): BasicResponse {
-        if (userRepository.findByEmail(request.email) != null) {
-            return BasicResponse("Email already taken")
-        }
-    
-        val newUser = User(
-            name = request.name,
-            email = request.email,
-            password = request.password,
-            age = request.age,
-            gender = request.gender,
-            createdAt = LocalDateTime.now(),
-            profilePicture = null // not used during registration
+fun register(request: RegisterRequest): RegisterResponse {
+    val existingUser = userRepository.findByEmail(request.email)
+    if (existingUser != null) {
+        return RegisterResponse(
+            success = false,
+            message = "Email already taken",
+            userId = -1L
         )
-    
-        userRepository.save(newUser)
-        return BasicResponse("User registered successfully")
     }
 
+    val newUser = User(
+        name = request.name,
+        email = request.email,
+        password = request.password,
+        age = request.age,
+        gender = request.gender,
+        createdAt = LocalDateTime.now(),
+        profilePicture = null
+    )
+
+    val savedUser = userRepository.save(newUser)
+
+
+    // Automatically create empty medical info for the new user
+    medicalInfoService.createMedicalInfo(
+                userId = savedUser.id,
+                bloodType = null,
+                allergies = null,
+                medications = null
+            )
+
+    return RegisterResponse(
+        success = true,
+        message = "User registered successfully",
+        userId = savedUser.id ?: -1L
+    )
+}
 fun login(request: LoginRequest): LoginResponse {
     val user = userRepository.findByEmail(request.email)
     return if (user == null) {

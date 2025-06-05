@@ -23,3 +23,10 @@ data class LoginResponse(
     val message: String,
     val userId: Long,
 )
+
+
+data class RegisterResponse(
+    val success: Boolean,
+    val message: String,
+    val userId: Long,
+)
