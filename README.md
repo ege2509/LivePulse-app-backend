@@ -13,4 +13,4 @@ Kotlin-based backend server for processing real-time 12-lead ECG data and transm
 - TCP Sockets
 - WebSocket
 - MySQL
-- Ktor (or your backend framework, if applicable)
+
