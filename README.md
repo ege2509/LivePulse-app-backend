@@ -16,6 +16,6 @@ Kotlin-based backend server for processing real-time 12-lead ECG data and transm
 
 ### Prerequisites
 - Kotlin
-- MySQL
+- PostgreSQL
 - JVM installed
 
